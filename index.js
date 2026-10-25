@@ -294,7 +294,7 @@ export const Config = Schema.object({
   /** 展示汇率（USD → CNY）；金额账本恒存美元，展示时换算。 */
   exchangeRate: Schema.number().default(7.2).description('展示汇率（USD→CNY）'),
   /** 自定义单价覆盖：{ "模型id": { cacheHit, cacheMiss, output } }（USD/1M）。 */
-  customPrices: Schema.object().default({}).description('自定义模型单价（USD/1M tokens）'),
+  customPrices: Schema.object({}).default({}).description('自定义模型单价（USD/1M tokens）'),
   /** 账本保留天数。 */
   retentionDays: Schema.number().default(180).description('历史保留天数'),
   budgetEnabled: Schema.boolean().default(false).description('启用预算'),
