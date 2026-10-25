@@ -28,7 +28,7 @@
  */
 
 import Schema from '@deepseek-ai/schemastery'
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -39,6 +39,7 @@ export const name = 'cost'
 const DIAG_LOG = join(homedir(), '.dsh', 'cost-debug.log')
 const STORE_DIR = join(homedir(), '.dsh', 'storages', 'dsh-cost')
 const LEDGER_PATH = join(STORE_DIR, 'ledger.json')
+const JOURNAL_PATH = join(STORE_DIR, 'journal.jsonl')
 
 const report = async (line) => {
   try {
@@ -120,6 +121,80 @@ function costOfBuckets(buckets, tier) {
     + amount(buckets.cacheWrite) * (tier.cacheWrite ?? tier.cacheHit)
     + amount(buckets.reasoning) * (typeof tier.reasoning === 'number' ? tier.reasoning : 0)) / 1_000_000
   return Number.isFinite(cost) && cost > 0 ? cost : 0
+}
+
+/* ------------------------------------------------------------------ */
+/* 用量指纹去重（cost-meter issue #70/#76 同款兜底）                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * (model, 五桶指纹) 10s 窗互斥：包装路由插件在 ALS 标记逃逸的异步上下文里
+ * 发起上游调用时，同一请求的两份 usage 都会到达这里——五桶逐位相同即判重，
+ * 无论到达顺序只记第一次。正常独立调用五桶逐位相同的概率可忽略。
+ */
+function createUsageDeduper(windowMs = 10_000) {
+  const seen = new Map()
+  return (model, buckets, atMs) => {
+    const fingerprint = `${normalizeModelId(model)}|${buckets.input}|${buckets.output}|${buckets.cacheRead}|${buckets.cacheWrite}|${buckets.reasoning}`
+    const last = seen.get(fingerprint)
+    if (last !== undefined && atMs - last < windowMs) return false
+    seen.set(fingerprint, atMs)
+    if (seen.size > 512) {
+      const cutoff = atMs - windowMs
+      for (const [key, seenAt] of seen) if (seenAt < cutoff) seen.delete(key)
+    }
+    return true
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 调用明细 journal（JSONL 追加；rotate 保留最近 3 卷）                  */
+/* ------------------------------------------------------------------ */
+
+const JOURNAL_MAX_BYTES = 8 * 1024 * 1024
+const JOURNAL_KEEP = 3
+
+function createJournal() {
+  let lines = 0
+  return {
+    /** 明细纯记录，写失败绝不影响聚合账本。 */
+    async write(record) {
+      try {
+        lines += 1
+        if (lines % 500 === 0) {
+          const info = await stat(JOURNAL_PATH).catch(() => null)
+          if (info && info.size > JOURNAL_MAX_BYTES) {
+            await rename(JOURNAL_PATH, join(STORE_DIR, `journal-${Date.now()}.jsonl`)).catch(() => {})
+            try {
+              const entries = await readdir(STORE_DIR)
+              const archives = entries.filter((name) => /^journal-\d+\.jsonl$/.test(name)).sort()
+              while (archives.length > JOURNAL_KEEP) {
+                await unlink(join(STORE_DIR, archives.shift())).catch(() => {})
+              }
+            } catch { /* ignore */ }
+          }
+        }
+        await appendFile(JOURNAL_PATH, `${JSON.stringify(record)}\n`, 'utf8')
+      } catch { /* ignore */ }
+    },
+    /** 读当前卷的倒序明细（归档卷不参与，最近 UI 只看当下）。 */
+    async recent({ sessionId = '', day = '', limit = 20 } = {}) {
+      let text = ''
+      try { text = await readFile(JOURNAL_PATH, 'utf8') } catch { return [] }
+      const rows = []
+      for (const line of text.split('\n')) {
+        if (!line) continue
+        try {
+          const row = JSON.parse(line)
+          if (sessionId && row.session !== sessionId) continue
+          if (day && row.day !== day) continue
+          rows.push(row)
+        } catch { /* 半行跳过 */ }
+      }
+      rows.reverse()
+      return rows.slice(0, Math.min(200, Math.max(1, limit)))
+    },
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -222,16 +297,22 @@ export const Config = Schema.object({
   customPrices: Schema.object().default({}).description('自定义模型单价（USD/1M tokens）'),
   /** 账本保留天数。 */
   retentionDays: Schema.number().default(180).description('历史保留天数'),
+  budgetEnabled: Schema.boolean().default(false).description('启用预算'),
+  budgetAmount: Schema.number().default(50).description('预算金额（CNY）'),
+  budgetPeriod: Schema.union(['day', 'month', 'all']).default('month').description('预算周期'),
 })
 
 export function apply(ctx, config) {
   if (!config.enabled) return
 
-  void report(`server boot v0.1.0 pid=${process.pid} retention=${config.retentionDays} rate=${config.exchangeRate}`)
+  void report(`server boot v0.2.0 pid=${process.pid} retention=${config.retentionDays} rate=${config.exchangeRate} budget=${config.budgetEnabled ? `${config.budgetAmount}/${config.budgetPeriod}` : 'off'}`)
 
   const ledger = createLedger(config.retentionDays)
   ledger.load()
   ctx.effect(() => ledger.dispose(), 'dsh-cost: ledger flush')
+
+  const admitUsage = createUsageDeduper()
+  const journal = createJournal()
 
   /** 深度标记：存在即「已知会、不需要再入账」的 llm 流（嵌套排除）。 */
   const llmDepth = new AsyncLocalStorage()
@@ -292,12 +373,27 @@ export function apply(ctx, config) {
             }
             const entry = priceEntryFor(model)
             if (entry) {
-              const cost = costOfBuckets(buckets, tierFor(entry, startedAtMs, isPeakAt(startedAtMs)))
-              ledger.account({ sessionId, model, buckets, cost, atMs: startedAtMs })
-              accountCount += 1
-              // 采样留痕（前 10 条全记，之后 1/20），足以判定通路与发现异常。
-              if (accountCount <= 10 || accountCount % 20 === 0) {
-                void report(`accounted #${accountCount} pid=${process.pid} model=${model} provider=${provider} session=${sessionId ? sessionId.slice(0, 40) : '(none)'} peak=${isPeakAt(startedAtMs) ? 1 : 0} buckets=${JSON.stringify(buckets)} cost=$${cost.toFixed(6)}`)
+              // 指纹去重兜底：ALS 逃逸的包装路由双份 usage 在此互斥（10s 窗）。
+              if (admitUsage(model, buckets, startedAtMs)) {
+                const cost = costOfBuckets(buckets, tierFor(entry, startedAtMs, isPeakAt(startedAtMs)))
+                ledger.account({ sessionId, model, buckets, cost, atMs: startedAtMs })
+                void journal.write({
+                  at: startedAtMs,
+                  day: localDayKey(startedAtMs),
+                  session: sessionId || '',
+                  model,
+                  provider,
+                  ...buckets,
+                  cost,
+                  peak: isPeakAt(startedAtMs),
+                })
+                accountCount += 1
+                // 采样留痕（前 10 条全记，之后 1/20），足以判定通路与发现异常。
+                if (accountCount <= 10 || accountCount % 20 === 0) {
+                  void report(`accounted #${accountCount} pid=${process.pid} model=${model} provider=${provider} session=${sessionId ? sessionId.slice(0, 40) : '(none)'} peak=${isPeakAt(startedAtMs) ? 1 : 0} buckets=${JSON.stringify(buckets)} cost=$${cost.toFixed(6)}`)
+                }
+              } else {
+                void report(`dedup skip model=${model} buckets=${JSON.stringify(buckets)}`)
               }
             } else if (model && !unmatchedModels.has(model)) {
               // 未内置价格的第三方模型按 default 档（flash 现行价）计费，
@@ -351,6 +447,15 @@ export function apply(ctx, config) {
             }
           }
           sessions.sort((a, b) => b.at - a.at)
+          // 预算：以展示币种（CNY）计，used 由对应周期的账本金额换算。
+          const budgetReady = config.budgetEnabled && Number(config.budgetAmount) > 0
+          const budgetUsd = budgetReady
+            ? (config.budgetPeriod === 'day'
+              ? (snap.days[todayKey]?.cost ?? 0)
+              : config.budgetPeriod === 'month'
+                ? (month?.cost ?? 0)
+                : total.cost)
+            : 0
           send(200, {
             serverNow: now,
             display: { currency: 'CNY', rate: config.exchangeRate },
@@ -358,11 +463,23 @@ export function apply(ctx, config) {
             today: todayKey in snap.days ? summarize(snap.days[todayKey]) : null,
             month,
             total: summarize(total),
+            budget: budgetReady
+              ? { amount: config.budgetAmount, period: config.budgetPeriod, used: budgetUsd * config.exchangeRate, usedPct: budgetUsd * config.exchangeRate / config.budgetAmount }
+              : null,
             recent,
             sessions: sessions.slice(0, 20),
             unmatched: [...unmatchedModels],
             streamAlive: streamArmed,
           })
+          return
+        }
+
+        if (path === '/calls' && req.method === 'GET') {
+          const url = new URL(req.url ?? '/api/dsh-cost/calls', 'http://localhost')
+          const sessionId = url.searchParams.get('session') ?? ''
+          const day = url.searchParams.get('day') ?? ''
+          const limit = Number(url.searchParams.get('limit') ?? 20)
+          send(200, { calls: await journal.recent({ sessionId, day, limit }) })
           return
         }
 

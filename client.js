@@ -76,6 +76,12 @@ window.__ModuleLoader__.load({
 .dsh-cost-row .dsh-cost-dim { flex: none; color: var(--dsw-alias-label-tertiary); }
 .dsh-cost-empty { padding: 12px 14px; font-size: 12px; color: var(--dsw-alias-label-tertiary); }
 .dsh-cost-badge { display: inline-flex; align-items: center; height: 18px; padding: 0 6px; border-radius: 4px; background: var(--dsw-alias-bg-layer-2, transparent); font-size: 11px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
+.dsh-cost-budget { display: flex; flex-direction: column; gap: 6px; padding: 10px 14px; border-radius: 10px; background: var(--dsw-alias-bg-layer-1, transparent); }
+.dsh-cost-budget-head { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; line-height: 20px; color: var(--dsw-alias-label-secondary); font-variant-numeric: tabular-nums; }
+.dsh-cost-bar { height: 6px; border-radius: 3px; background: var(--dsw-alias-interactive-bg-hover); overflow: hidden; }
+.dsh-cost-fill { height: 100%; border-radius: 3px; background: var(--dsw-alias-brand-primary); }
+.dsh-cost-fill.warn { background: var(--dsw-alias-state-warn-primary); }
+.dsh-cost-fill.over { background: var(--dsw-alias-state-error-primary); }
 `
 
     function ensureStyle() {
@@ -196,15 +202,56 @@ window.__ModuleLoader__.load({
       const title = today
         ? `${today.calls} 次调用 · token ${(tokensOf(today) / 1000).toFixed(1)}k · ${state.peak?.isPeak ? '峰时' : '谷时'}`
         : '今日暂无调用'
+      const overBudget = state.budget && state.budget.usedPct >= 0.8
       return h('button', {
         type: 'button',
         className: 'dsh-cost-today',
         title,
+        style: overBudget ? { color: 'var(--dsw-alias-state-warn-primary)' } : undefined,
         onClick: () => { void pollOnce() },
       }, h('span', null, `今日 ${moneyOf(state, today?.cost ?? 0)}`))
     }
 
     /* -- 界面三：设置页「费用」分节 ------------------------------------ */
+
+    function BudgetCard({ state }) {
+      const budget = state?.budget
+      if (!budget) return null
+      const pct = Math.min(100, Math.max(0, budget.usedPct * 100))
+      const tier = budget.usedPct >= 1 ? 'over' : budget.usedPct >= 0.8 ? 'warn' : ''
+      const periodLabel = budget.period === 'day' ? '今日' : budget.period === 'month' ? '本月' : '累计'
+      return h('div', { className: 'dsh-cost-budget' },
+        h('div', { className: 'dsh-cost-budget-head' },
+          h('span', null, `预算（${periodLabel}）`),
+          h('span', null, `¥${Number(budget.used).toFixed(2)} / ¥${Number(budget.amount).toFixed(2)} · ${(budget.usedPct * 100).toFixed(0)}%`)),
+        h('div', { className: 'dsh-cost-bar' }, h('div', { className: `dsh-cost-fill ${tier}`, style: { width: `${pct}%` } })))
+    }
+
+    function RecentCalls({ state }) {
+      const [calls, setCalls] = React.useState(null)
+      React.useEffect(() => {
+        let alive = true
+        const load = async () => {
+          try {
+            const res = await fetch(`${ENDPOINT}/calls?limit=10`, { cache: 'no-store' })
+            if (!res.ok) return
+            const data = await res.json()
+            if (alive && Array.isArray(data.calls)) setCalls(data.calls)
+          } catch { /* ignore */ }
+        }
+        void load()
+        const timerId = setInterval(load, POLL_MS * 2)
+        return () => { alive = false; clearInterval(timerId) }
+      }, [])
+      if (!calls) return null
+      if (calls.length === 0) return null
+      return h('div', { className: 'dsh-cost-table' },
+        calls.map((call, index) => h('div', { className: 'dsh-cost-row', key: `${call.at}-${index}` },
+          h('span', { className: 'dsh-cost-dim' }, new Date(call.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })),
+          h('span', { className: 'dsh-cost-grow' }, String(call.model ?? '').replace(/^deepseek-/, '')),
+          h('span', { className: 'dsh-cost-dim' }, `${((call.input ?? 0) + (call.output ?? 0) + (call.cacheRead ?? 0) + (call.cacheWrite ?? 0)).toLocaleString()} tok`),
+          h('span', { className: 'dsh-cost-num' }, moneyOf(state, call.cost)))))
+    }
 
     function CostCard({ title, row, state }) {
       return h('div', { className: 'dsh-cost-card' },
@@ -242,7 +289,13 @@ window.__ModuleLoader__.load({
       if (Array.isArray(state?.unmatched) && state.unmatched.length > 0) {
         footerBits.push(h('span', { className: 'dsh-cost-badge', key: 'unmatched', title: state.unmatched.join(', ') }, `${state.unmatched.length} 个模型按默认档计费`))
       }
-      return h('div', { className: 'dsh-cost-section' }, cards, recent, sessions, h('div', { style: { display: 'flex', gap: '6px' } }, footerBits))
+      return h('div', { className: 'dsh-cost-section' },
+        h(BudgetCard, { state }),
+        cards,
+        recent,
+        sessions,
+        h(RecentCalls, { state }),
+        h('div', { style: { display: 'flex', gap: '6px' } }, footerBits))
     }
 
     /* -- 装配 ---------------------------------------------------------- */
@@ -252,7 +305,7 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         ensureStyle()
         startPoller()
-        console.info('[dsh-cost] client 0.1.0 active')
+        console.info('[dsh-cost] client 0.2.0 active')
         ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
           name: 'conversation.input.dock',
           id: 'dsh-cost-session',

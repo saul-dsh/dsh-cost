@@ -6,7 +6,9 @@ dsh（DeepSeek Harness）会话费用统计插件：每次模型调用按 DeepSe
 
 ## 功能
 
-- **实时计量**：llm/stream 链尾旁路捕获 usage 五桶（输入 / 输出 / 缓存读 / 缓存写 / 推理），按官方价格计费；AsyncLocalStorage 深度标记防包装路由嵌套重复入账。
+- **实时计量**：llm/stream 链尾旁路捕获 usage 五桶（输入 / 输出 / 缓存读 / 缓存写 / 推理），按官方价格计费；ALS 深度标记 + (model, 五桶指纹) 10s 窗去重双重防包装路由重复入账。
+- **调用明细**：每次入账追加 journal.jsonl（8 MiB 轮转留 3 卷），`GET /api/dsh-cost/calls` 可按会话/按日倒序查询；设置页展示最近调用。
+- **预算**：按日 / 本月 / 累计限额（CNY），进度条 ≥80% 警告、≥100% 超支变色。
 - **峰谷分档**：峰窗 UTC 01–04 / 06–10 点（北京 09–12 / 14–18），北京周六日与法定节假日全天谷价；历史流量按当时档位（2026-09-10 Flash 调价、2026-08-16 峰谷时代前均有历史价）。
 - **账本**：`~/.dsh/storages/dsh-cost/ledger.json`，按日聚合（总量 / 按模型 / 按会话），临时文件原子重命名 + 防抖写盘，默认保留 180 天。
 - **界面**：输入区上方本会话费用 chip（hover 明细、点击刷新）；侧栏底部今日费用；设置 → 费用：今日 / 本月 / 累计卡片、近 7 天、最近会话列表、峰谷状态与未匹配模型提示。
@@ -29,6 +31,9 @@ dsh plugin --profile web add <本目录绝对路径>
 | `exchangeRate` | `7.2` | 展示汇率（USD → CNY） |
 | `customPrices` | `{}` | 自定义单价 `{ "模型id": { cacheHit, cacheMiss, output } }` |
 | `retentionDays` | `180` | 账本保留天数 |
+| `budgetEnabled` | `false` | 启用预算 |
+| `budgetAmount` | `50` | 预算金额（CNY） |
+| `budgetPeriod` | `month` | 预算周期：`day` / `month` / `all` |
 
 ## 边界（v0.1.0）
 

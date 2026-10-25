@@ -2,6 +2,21 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0] - 2026-10-25
+
+### 正确性与数据完整性（对照 dsh-cost-meter 差距分析第一层）
+
+- **用量指纹去重**（cost-meter issue #70/#76 同款兜底）：(model, 五桶指纹)
+  10 秒窗互斥，ALS 标记逃逸的包装路由双份 usage 无论到达顺序只记一次；
+  拒绝时 debug log 留 `dedup skip` 便于排查误杀。
+- **调用明细 journal**：每次入账同步追加 `journal.jsonl`（at/day/session/
+  model/provider/五桶/cost/peak），8 MiB 自动轮转保留最近 3 卷；写失败绝不
+  影响聚合账本。新增 `GET /api/dsh-cost/calls?session=&day=&limit=` 倒序查询。
+- **预算**：配置 `budgetEnabled/budgetAmount(CNY)/budgetPeriod(day|month|all)`；
+  `/state` 下发 `budget{amount,used,usedPct}`；设置页预算卡（进度条，
+  ≥80% warn 色、≥100% over 色），侧栏今日费用同步超阈变色。
+- 设置页新增「最近调用」表（时间/模型/token/金额，2×轮询）。
+
 ## [0.1.0] - 2026-10-25
 
 ### 首个版本：借鉴 dsh-cost-meter 的最小可用费用统计

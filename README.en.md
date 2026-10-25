@@ -6,7 +6,9 @@ Architecture borrows from [Han-1413141/dsh-cost-meter](https://github.com/Han-14
 
 ## Features
 
-- **Real-time metering**: tail listener on the llm/stream waterfall captures the five usage buckets (input / output / cache-read / cache-write / reasoning); AsyncLocalStorage depth marker prevents double-billing through wrapper-router plugins.
+- **Real-time metering**: tail listener on the llm/stream waterfall captures the five usage buckets (input / output / cache-read / cache-write / reasoning); an ALS depth marker plus (model, five-bucket fingerprint) 10s-window dedup double-guard against wrapper-router double billing.
+- **Call journal**: every charge appends to journal.jsonl (8 MiB rotation, last 3 kept); `GET /api/dsh-cost/calls` queries reverse-chronologically by session or day; the settings page shows recent calls.
+- **Budget**: per-day / monthly / all-time limit (CNY) with a progress bar that turns warning at ≥80% and over-budget color at ≥100%.
 - **Peak/off-peak tiers**: peak windows UTC 01–04 and 06–10 (Beijing 09–12 / 14–18); all-day off-peak on Beijing weekends and public holidays; historical traffic billed at the tier of its time (Flash repricing of 2026-09-10 and the pre-peak-era base before 2026-08-16 included).
 - **Ledger**: `~/.dsh/storages/dsh-cost/ledger.json`, aggregated per day (totals / per model / per session), atomic temp-file rename + debounced writes, 180-day retention by default.
 - **UI**: per-session cost chip above the composer (hover detail, click to refresh); today's cost at the sidebar bottom; Settings → Cost with today / month / total cards, last 7 days, recent sessions, peak status and unmatched-model notice.
@@ -29,6 +31,9 @@ A full restart of dsh is required. Debug log: `~/.dsh/cost-debug.log` (boot / fi
 | `exchangeRate` | `7.2` | display rate (USD → CNY) |
 | `customPrices` | `{}` | per-model overrides `{ "model-id": { cacheHit, cacheMiss, output } }` |
 | `retentionDays` | `180` | ledger retention |
+| `budgetEnabled` | `false` | enable budget |
+| `budgetAmount` | `50` | budget amount (CNY) |
+| `budgetPeriod` | `month` | budget period: `day` / `month` / `all` |
 
 ## Boundaries (v0.1.0)
 
