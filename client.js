@@ -499,16 +499,18 @@ window.__ModuleLoader__.load({
         .catch(() => closeTurnCostPop())
     }
 
-    /** 扫描官方「用量 X tok」按钮，在其前插入同款费用按钮（每按钮只插一次）。 */
+    /** 扫描官方「用量 X tok」按钮，在其后插入同款费用按钮（按钮自身打标记防重复）。 */
     function mountUsageAnchors() {
       const buttons = document.querySelectorAll('button')
       for (const button of buttons) {
         if (button.offsetParent === null) continue
-        if (button.previousElementSibling?.classList.contains('dsh-cost-usage-anchor')) continue
+        // 标记挂在用量按钮自身：兄弟检查在 afterend 插入后会漏判导致无限堆叠。
+        if (button.dataset.dshCostAnchor === '1') continue
         const text = (button.textContent ?? '').trim()
         if (!text.startsWith('用量') || !text.includes('tok')) continue
         const details = findTurnDetails(button)
         if (!details) continue
+        button.dataset.dshCostAnchor = '1'
         const anchor = document.createElement('button')
         anchor.className = 'dsh-cost-usage-anchor'
         anchor.type = 'button'
