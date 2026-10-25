@@ -778,13 +778,31 @@ export function apply(ctx, config) {
    * 落在窗口内算它们的调用，否则一律算对话。读一次就清，避免串到下一次。
    */
   const CALL_SOURCE_TTL_MS = 5000
-  function callSource() {
+
+  /** 各插件自己的 prompt 特征：跨进程时 globalThis 不共享，只能看内容。 */
+  const SOURCE_SIGNATURES = [
+    { source: 'followup', needle: 'You generate follow-up suggestions' },
+    { source: 'enhance', needle: "You are a Prompt Engineering Expert" },
+  ]
+
+  function callSource(options) {
+    // 1) 同进程时的显式标记（prompt-enhancer / followup 调用前写入）
     const marker = globalThis.__dshPluginCall
     if (marker && typeof marker.at === 'number' && Date.now() - marker.at < CALL_SOURCE_TTL_MS) {
       const source = typeof marker.source === 'string' && marker.source ? marker.source : 'chat'
       globalThis.__dshPluginCall = undefined
       return source
     }
+    // 2) 兜底：按 prompt 特征识别，插件跑在别的进程时也能分开记
+    try {
+      const messages = options?.messages
+      if (messages) {
+        const text = JSON.stringify(messages)
+        for (const entry of SOURCE_SIGNATURES) {
+          if (text.includes(entry.needle)) return entry.source
+        }
+      }
+    } catch { /* 序列化失败就当普通对话 */ }
     return 'chat'
   }
 
@@ -862,7 +880,7 @@ export function apply(ctx, config) {
                   rows: bucketRows(buckets, tier),
                   cost,
                   peak,
-                  source: callSource(),
+                  source: callSource(options),
                 })
                 accountCount += 1
                 // 采样留痕（前 10 条全记，之后 1/20），足以判定通路与发现异常。
