@@ -127,6 +127,21 @@ function costOfBuckets(buckets, tier) {
 /* 用量指纹去重（cost-meter issue #70/#76 同款兜底）                     */
 /* ------------------------------------------------------------------ */
 
+/** 桶名 → 价格键（costOfBuckets 同款映射；cacheWrite 缺价按 cacheHit）。 */
+const BUCKET_PRICE_KEYS = { input: 'cacheMiss', output: 'output', cacheRead: 'cacheHit', cacheWrite: 'cacheWrite', reasoning: 'reasoning' }
+
+/** 一次调用的分桶计价行（cost-meter costFromSamples 同形状），供回合明细。 */
+function bucketRows(buckets, tier) {
+  const rows = []
+  for (const [bucket, priceKey] of Object.entries(BUCKET_PRICE_KEYS)) {
+    const tokens = Number(buckets[bucket]) > 0 ? Number(buckets[bucket]) : 0
+    if (!tokens) continue
+    const rate = Number(tier[priceKey] ?? (priceKey === 'cacheWrite' ? tier.cacheHit : 0))
+    rows.push({ bucket, tokens, rate, cost: tokens * rate / 1_000_000 })
+  }
+  return rows
+}
+
 /**
  * (model, 五桶指纹) 10s 窗互斥：包装路由插件在 ALS 标记逃逸的异步上下文里
  * 发起上游调用时，同一请求的两份 usage 都会到达这里——五桶逐位相同即判重，
@@ -193,6 +208,34 @@ function createJournal() {
       }
       rows.reverse()
       return rows.slice(0, Math.min(200, Math.max(1, limit)))
+    },
+    /**
+     * 回合费用：会话在 [from,to] 时间窗内的调用聚合（客户端 turnTail 槽位
+     * 传宿主 turn/start~turn/end 事件时间）。journal 只保当前卷——轮转掉的
+     * 旧回合查不到，金额对 UI 恒标「≈」估算口径。
+     */
+    async range({ sessionId = '', from = 0, to = Number.MAX_SAFE_INTEGER } = {}) {
+      let text = ''
+      try { text = await readFile(JOURNAL_PATH, 'utf8') } catch { return { found: false, cost: 0, rows: [], calls: [] } }
+      const calls = []
+      const parts = new Map()
+      for (const line of text.split('\n')) {
+        if (!line) continue
+        let row
+        try { row = JSON.parse(line) } catch { continue }
+        if (row.session !== sessionId || !(row.at >= from && row.at <= to)) continue
+        calls.push({ model: row.model, provider: row.provider, at: row.at, cost: row.cost })
+        for (const item of Array.isArray(row.rows) ? row.rows : []) {
+          const key = JSON.stringify([row.provider, row.model, item.bucket])
+          const part = parts.get(key) ?? { provider: row.provider, model: row.model, bucket: item.bucket, tokens: 0, rate: item.rate, cost: 0 }
+          part.tokens += item.tokens
+          part.cost += item.cost
+          parts.set(key, part)
+        }
+      }
+      calls.sort((a, b) => a.at - b.at)
+      const rows = [...parts.values()].sort((a, b) => b.cost - a.cost)
+      return { found: calls.length > 0, cost: calls.reduce((sum, call) => sum + call.cost, 0), rows, calls }
     },
   }
 }
@@ -375,7 +418,9 @@ export function apply(ctx, config) {
             if (entry) {
               // 指纹去重兜底：ALS 逃逸的包装路由双份 usage 在此互斥（10s 窗）。
               if (admitUsage(model, buckets, startedAtMs)) {
-                const cost = costOfBuckets(buckets, tierFor(entry, startedAtMs, isPeakAt(startedAtMs)))
+                const peak = isPeakAt(startedAtMs)
+                const tier = tierFor(entry, startedAtMs, peak)
+                const cost = costOfBuckets(buckets, tier)
                 ledger.account({ sessionId, model, buckets, cost, atMs: startedAtMs })
                 void journal.write({
                   at: startedAtMs,
@@ -384,13 +429,14 @@ export function apply(ctx, config) {
                   model,
                   provider,
                   ...buckets,
+                  rows: bucketRows(buckets, tier),
                   cost,
-                  peak: isPeakAt(startedAtMs),
+                  peak,
                 })
                 accountCount += 1
                 // 采样留痕（前 10 条全记，之后 1/20），足以判定通路与发现异常。
                 if (accountCount <= 10 || accountCount % 20 === 0) {
-                  void report(`accounted #${accountCount} pid=${process.pid} model=${model} provider=${provider} session=${sessionId ? sessionId.slice(0, 40) : '(none)'} peak=${isPeakAt(startedAtMs) ? 1 : 0} buckets=${JSON.stringify(buckets)} cost=$${cost.toFixed(6)}`)
+                  void report(`accounted #${accountCount} pid=${process.pid} model=${model} provider=${provider} session=${sessionId ? sessionId.slice(0, 40) : '(none)'} peak=${peak ? 1 : 0} buckets=${JSON.stringify(buckets)} cost=$${cost.toFixed(6)}`)
                 }
               } else {
                 void report(`dedup skip model=${model} buckets=${JSON.stringify(buckets)}`)
@@ -480,6 +526,17 @@ export function apply(ctx, config) {
           const day = url.searchParams.get('day') ?? ''
           const limit = Number(url.searchParams.get('limit') ?? 20)
           send(200, { calls: await journal.recent({ sessionId, day, limit }) })
+          return
+        }
+
+        // 回合费用：turnTail 槽位传宿主 turn/start~turn/end 事件时间窗。
+        if (path === '/turn' && req.method === 'GET') {
+          const url = new URL(req.url ?? '/api/dsh-cost/turn', 'http://localhost')
+          const sessionId = url.searchParams.get('session') ?? ''
+          const from = Number(url.searchParams.get('from') ?? 0)
+          const to = Number(url.searchParams.get('to') ?? Number.MAX_SAFE_INTEGER)
+          if (!sessionId || !Number.isFinite(from) || !Number.isFinite(to)) { send(400, { error: 'missing session/from/to' }); return }
+          send(200, await journal.range({ sessionId, from, to }))
           return
         }
 

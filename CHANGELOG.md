@@ -2,6 +2,24 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-10-25
+
+### 新增：每轮对话尾部的回合费用（搬运 dsh-cost-meter TurnCost）
+
+cost-meter 的做法：`conversation.chat.turnTail` 槽位（宿主给每个完成的回合
+渲染一次，props 自带 `turn.start/.end` 宿主事件与 `sessionId`）+ 服务端按
+回合范围聚合。搬 ours：
+
+- **journal 行新增分桶计价 rows**（bucket/tokens/rate/cost，cost-meter
+  `costFromSamples` 同形状）——入账时按档位单价算好，聚合不再反推。
+- **服务端 `GET /api/dsh-cost/turn?session=&from=&to=`**：journal 按会话 +
+  时间窗聚合出 `{found, cost, rows(按 provider×model×bucket 累加), calls}`。
+- **客户端 `conversation.chat.turnTail` 槽位**（order 10，cost-meter 同位）：
+  每个回合尾部一行小字「本轮费用 ≈ ¥0.05」，点击展开分桶明细（模型 · 桶 ·
+  tokens · 金额）；回合未结束（turn.end 缺）不显示；journal 轮转掉的旧回合
+  无记录时只显示标题。金额口径为 journal 估算（与侧栏/账本的入账制一致来源）。
+- **需完整重启 dsh**（改了服务端端点）。
+
 ## [0.3.0] - 2026-10-25
 
 ### UI 重构：费用信息隐入官方布局（真机截图反馈）

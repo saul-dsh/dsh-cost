@@ -52,6 +52,10 @@ window.__ModuleLoader__.load({
   font-variant-numeric: tabular-nums;
 }
 .dsh-cost-sidebar.warn .dsh-cost-sidebar-value { color: var(--dsw-alias-state-warn-primary); }
+.dsh-cost-turn { margin-top: 6px; font-size: 12px; line-height: 20px; }
+.dsh-cost-turn summary { cursor: pointer; color: var(--dsw-alias-label-tertiary, rgba(232, 238, 250, 0.55)); user-select: none; }
+.dsh-cost-turn summary:hover { color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72)); }
+.dsh-cost-turn-row { padding: 2px 0; overflow-wrap: anywhere; color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72)); font-variant-numeric: tabular-nums; }
 .dsh-cost-section { display: flex; flex-direction: column; gap: 16px; padding: 4px 2px 24px; font-size: 13px; color: var(--dsw-alias-label-primary); }
 .dsh-cost-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 @media (max-width: 1023px) { .dsh-cost-cards { grid-template-columns: 1fr; } }
@@ -266,7 +270,39 @@ window.__ModuleLoader__.load({
       h('span', { className: 'dsh-cost-sidebar-value' }, moneyOf(state, today?.cost ?? 0)))
     }
 
-    /* -- 界面三：设置页「费用」分节 ------------------------------------ */
+    /* -- 界面三：回合费用（turnTail 槽位，cost-meter TurnCost 同款） ---- */
+
+    const TURN_BUCKET_NAMES = { input: '输入', output: '输出', cacheRead: '缓存读取', cacheWrite: '缓存写入', reasoning: '推理' }
+
+    function TurnCost(props) {
+      const state = useCostState()
+      const turn = props.turn
+      const sessionId = props.sessionId
+      const [value, setValue] = React.useState(null)
+      const start = turn?.start?.time
+      const end = turn?.end?.time
+      React.useEffect(() => {
+        let active = true
+        setValue(null)
+        if (!sessionId || start == null || end == null) return
+        fetch(`${ENDPOINT}/turn?session=${encodeURIComponent(sessionId)}&from=${start}&to=${end}`, { cache: 'no-store' })
+          .then((res) => (res.ok ? res.json() : null))
+          .then((data) => { if (active && data) setValue(data) })
+          .catch(() => {})
+        return () => { active = false }
+      }, [sessionId, start, end])
+      if (start == null || end == null) return null
+      return h('details', { className: 'dsh-cost-turn' },
+        h('summary', null,
+          '本轮费用',
+          value ? (value.found ? ` ≈ ${moneyOf(state, value.cost)}` : '') : ''),
+        value && value.found
+          ? h('div', null, value.rows.map((row, index) => h('div', { className: 'dsh-cost-turn-row', key: index },
+            `${String(row.model ?? '').replace(/^deepseek-/, '')} · ${TURN_BUCKET_NAMES[row.bucket] ?? row.bucket}：${Number(row.tokens).toLocaleString()} tok · ${moneyOf(state, row.cost)}`)))
+          : null)
+    }
+
+    /* -- 界面四：设置页「费用」分节 ------------------------------------ */
 
     function BudgetCard({ state }) {
       const budget = state?.budget
@@ -368,6 +404,11 @@ window.__ModuleLoader__.load({
           id: 'dsh-cost-session',
           order: 90,
         }, SessionIdSensor))
+        ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
+          name: 'conversation.chat.turnTail',
+          id: 'dsh-cost-turn',
+          order: 10,
+        }, TurnCost))
         ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
           name: 'sidebar.footer.action',
           id: 'dsh-cost-today',
