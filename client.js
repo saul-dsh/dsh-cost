@@ -117,25 +117,36 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72)) !important;
   background: var(--dsw-alias-interactive-bg-hover) !important;
 }
-/* 官方弹卡基准（0.6.2 按 official-popover.template.css 从已装 asar 提取的
-   完整规则重写——底色是半透明的，必须带 backdrop-filter 毛玻璃才不穿帮）。 */
+/* 官方弹卡基准。底色照 dsh 的 macOS 档写死 0.94，不用 --dsw-specific-menu：
+   Windows 默认是 rgba(67,69,74,.45)，那是给带 MenuSurface 底衬的官方菜单用的；
+   插件直接 portal 到 body 没有底衬，0.45 一旦 backdrop-filter 失效就发灰糊在背景上。 */
 .dsh-cost-pop {
   position: fixed;
   z-index: 1100;
   box-sizing: border-box;
   border: 0;
-  border-radius: var(--dsw-radius-lg, 12px);
-  background: var(--dsw-specific-menu, rgba(67, 69, 74, 0.45));
-  backdrop-filter: var(--dsw-menu-backdrop-filter, blur(40px) saturate(150%));
-  -webkit-backdrop-filter: var(--dsw-menu-backdrop-filter, blur(40px) saturate(150%));
+  border-radius: 12px;
+  background: rgba(248, 249, 250, 0.94);
+  backdrop-filter: blur(40px) saturate(150%);
+  -webkit-backdrop-filter: blur(40px) saturate(150%);
   width: min(300px, 100vw - 24px);
-  --dsw-elevation-stroke-color: var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.08));
-  box-shadow: var(--dsw-elevation-prominent, 0 0 0 0.5px var(--dsw-elevation-stroke-color), 0 3px 8px 0 rgba(0, 0, 0, 0.04), 0 0 20px 0 rgba(0, 0, 0, 0.05));
-  color: var(--dsw-alias-label-secondary);
+  box-shadow:
+    0 0 0 0.5px rgba(0, 0, 0, 0.07),
+    0 3px 8px 0 rgba(0, 0, 0, 0.04),
+    0 0 20px 0 rgba(0, 0, 0, 0.05);
+  color: rgba(28, 30, 34, 0.86);
   cursor: default;
   padding: 12px;
   font-size: 12px;
   line-height: 20px;
+}
+body[data-ds-dark-theme] .dsh-cost-pop {
+  background: rgba(48, 49, 54, 0.94);
+  box-shadow:
+    0 0 0 0.5px rgba(255, 255, 255, 0.10),
+    0 3px 8px 0 rgba(0, 0, 0, 0.04),
+    0 0 20px 0 rgba(0, 0, 0, 0.05);
+  color: rgba(232, 238, 250, 0.72);
 }
 .dsh-cost-pop-head { display: flex; justify-content: space-between; gap: 12px; padding-bottom: 6px; margin-bottom: 4px; border-bottom: 1px solid var(--dsw-alias-border-l3, transparent); font-weight: 500; }
 .dsh-cost-pop-row { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
