@@ -792,10 +792,26 @@ body[data-ds-dark-theme] .dsh-cost-pop {
       React.useEffect(() => {
         if (!currentSessionId) { setSession(null); return undefined }
         let alive = true
+        // 优先 /session（跨所有日期折当前会话）。服务端还没热更新时它 404，
+        // 退回 /state 里的 sessions（近 7 天，同 id 可能按天拆成多条，累加）。
+        const fallback = () => {
+          const rows = (latestState?.sessions ?? []).filter((item) => item.id === currentSessionId)
+          if (rows.length === 0) { setSession(null); return }
+          const total = { cost: 0, calls: 0, bySource: {} }
+          for (const row of rows) {
+            total.cost += row.cost ?? 0
+            total.calls += row.calls ?? 0
+          }
+          setSession({ session: currentSessionId, total, calls: [], fallback: true })
+        }
         fetch(ENDPOINT + '/session?session=' + encodeURIComponent(currentSessionId), { cache: 'no-store' })
           .then((res) => (res.ok ? res.json() : null))
-          .then((value) => { if (alive) setSession(value) })
-          .catch(() => { /* 服务端未就绪：保持上一次的值 */ })
+          .then((value) => {
+            if (!alive) return
+            if (value && value.total) setSession(value)
+            else fallback()
+          })
+          .catch(() => { if (alive) fallback() })
         return () => { alive = false }
       }, [tick, currentSessionId])
 
