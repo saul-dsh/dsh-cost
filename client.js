@@ -240,7 +240,7 @@ window.__ModuleLoader__.load({
     const sessionAnchor = { span: null, host: null, observer: null, state: null }
 
     function sessionCostText() {
-      const state = sessionAnchor.state
+      const state = latestState
       if (!state || !currentSessionId || !Array.isArray(state.sessions)) return ''
       const session = state.sessions.find((item) => item.id === currentSessionId)
       if (!session) return ''
@@ -250,19 +250,27 @@ window.__ModuleLoader__.load({
     function renderSessionAnchor() {
       const span = sessionAnchor.span
       if (!span || !span.isConnected) return
-      span.textContent = sessionCostText() || ' · —'
+      const text = sessionCostText()
+      span.textContent = text
+      sessionAnchor.host.style.display = text ? '' : 'none'
     }
 
-    /** 找宿主状态行：含「缓存命中」或「tok/s」文案的**可见**元素的行容器。 */
+    /** 找宿主状态行容器：可见文本含「缓存命中」/「tok/s」，向上爬到含 ≥2 个
+     * 直接 button 子女的层——状态行由「5轮68步」「8M tok」「上下文 16%」等
+     * 多个指标按钮组成，锚要插在这一层之后才是整行末尾。 */
     function findStatusRow() {
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
       for (let node = walker.nextNode(); node; node = walker.nextNode()) {
         const text = node.textContent ?? ''
         if (!text.includes('缓存命中') && !text.includes('tok/s')) continue
-        const textParent = node.parentElement
-        if (!textParent || textParent.offsetParent === null) continue
-        // 行容器 = 文本父级的父级（状态行为 flex 行）。
-        const row = textParent.parentElement ?? textParent
+        let el = node.parentElement
+        if (!el || el.offsetParent === null) continue
+        let row = el
+        for (let depth = 0; depth < 6 && row.parentElement; depth += 1) {
+          const directButtons = [...row.children].filter((child) => child.tagName === 'BUTTON')
+          if (directButtons.length >= 2) break
+          row = row.parentElement
+        }
         if (row.offsetParent === null) continue
         return row
       }
@@ -283,8 +291,9 @@ window.__ModuleLoader__.load({
       host.className = 'dsh-cost-statusrow'
       const span = document.createElement('span')
       span.className = 'dsh-cost-inline'
-      span.textContent = sessionCostText() || ' · —'
+      span.textContent = sessionCostText()
       host.appendChild(span)
+      host.style.display = span.textContent ? '' : 'none'
       row.insertAdjacentElement('afterend', host)
       sessionAnchor.host = host
       sessionAnchor.span = span
