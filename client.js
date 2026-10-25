@@ -22,12 +22,31 @@ window.__ModuleLoader__.load({
     const ENDPOINT = '/api/dsh-cost'
     const POLL_MS = 15000
 
+    /** 客户端调试通道：关键锚定/装配事件上报服务端 debug log（真机取证）。 */
+    function clientDebug(message) {
+      try {
+        void fetch(`${ENDPOINT}/client-debug`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ message: String(message).slice(0, 300) }),
+        }).catch(() => {})
+      } catch { /* ignore */ }
+    }
+
     /* 官方 token 配色（compaction-control / cost-meter 同基准），无自创色。 */
     const CSS = `
 .dsh-cost-inline {
   font-variant-numeric: tabular-nums;
   color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72));
   white-space: nowrap;
+}
+.dsh-cost-statusrow {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 20px;
 }
 .dsh-cost-sidebar {
   display: flex;
@@ -218,7 +237,7 @@ window.__ModuleLoader__.load({
      * span 断线（宿主整行重建）时 MutationObserver 重挂；找不到特征行就不渲染
      * （宁缺毋滥，不在官方容器外悬空）。
      */
-    const sessionAnchor = { span: null, observer: null, state: null }
+    const sessionAnchor = { span: null, host: null, observer: null, state: null }
 
     function sessionCostText() {
       const state = sessionAnchor.state
@@ -231,43 +250,58 @@ window.__ModuleLoader__.load({
     function renderSessionAnchor() {
       const span = sessionAnchor.span
       if (!span || !span.isConnected) return
-      span.textContent = sessionCostText()
-      span.style.display = span.textContent ? '' : 'none'
+      span.textContent = sessionCostText() || ' · —'
     }
 
-    /** 找宿主状态行：含「缓存命中」或「tok/s」文案的文本节点 → 其父元素的父级（行容器）。 */
+    /** 找宿主状态行：含「缓存命中」或「tok/s」文案的**可见**元素的行容器。 */
     function findStatusRow() {
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
       for (let node = walker.nextNode(); node; node = walker.nextNode()) {
         const text = node.textContent ?? ''
         if (!text.includes('缓存命中') && !text.includes('tok/s')) continue
         const textParent = node.parentElement
-        if (!textParent) continue
-        return textParent.parentElement ?? textParent
+        if (!textParent || textParent.offsetParent === null) continue
+        // 行容器 = 文本父级的父级（状态行为 flex 行）。
+        const row = textParent.parentElement ?? textParent
+        if (row.offsetParent === null) continue
+        return row
       }
       return null
     }
 
     function mountSessionAnchor() {
       // 已挂且仍在文档中：不重复锚。
-      if (sessionAnchor.span?.isConnected) return
+      if (sessionAnchor.host?.isConnected) return
       const row = findStatusRow()
-      if (!row) return
+      if (!row) {
+        void clientDebug('anchor: status row not found (no visible tok/s text)')
+        return
+      }
+      // 插到状态行的**兄弟位置**（compaction-control 0.1.7 教训：append 进
+      // React 管理的容器会被重渲染清掉，兄弟位置宿主不管、重锚不打架）。
+      const host = document.createElement('div')
+      host.className = 'dsh-cost-statusrow'
       const span = document.createElement('span')
       span.className = 'dsh-cost-inline'
-      span.textContent = sessionCostText()
-      // 官方行尾若有按钮（ContextMeter 圆环），插到按钮前；否则排在行末。
-      const lastButton = row.querySelector(':scope > button:last-child')
-      if (lastButton) row.insertBefore(span, lastButton)
-      else row.appendChild(span)
+      span.textContent = sessionCostText() || ' · —'
+      host.appendChild(span)
+      row.insertAdjacentElement('afterend', host)
+      sessionAnchor.host = host
       sessionAnchor.span = span
+      void clientDebug('anchor: mounted after status row')
     }
 
     function startSessionAnchor() {
       mountSessionAnchor()
       sessionAnchor.observer = new MutationObserver(() => {
-        // 只处理我们 span 断线（宿主重建状态行）的情况，防自触发循环。
-        if (sessionAnchor.span?.isConnected) return
+        // 只处理我们 host 断线或脱离状态行的情况，防自触发循环。
+        const host = sessionAnchor.host
+        if (host?.isConnected) {
+          const prev = host.previousElementSibling
+          const text = prev?.textContent ?? ''
+          if (prev && (text.includes('缓存命中') || text.includes('tok/s'))) return
+        }
+        sessionAnchor.host = null
         sessionAnchor.span = null
         mountSessionAnchor()
       })

@@ -731,6 +731,17 @@ export function apply(ctx, config) {
           return
         }
 
+        // 客户端调试上报：锚定/装配事件落 debug log（真机取证）。
+        if (path === '/client-debug' && req.method === 'POST') {
+          let body = ''
+          for await (const chunk of req) body += chunk
+          let message = ''
+          try { message = String(JSON.parse(body).message ?? '').slice(0, 300) } catch { message = '' }
+          if (message) void report(`client: ${message}`)
+          send(200, { ok: true })
+          return
+        }
+
         // 导出：全量 JSON（含日/模型/会话聚合）或日汇总 CSV。
         if (path === '/export' && req.method === 'GET') {
           const url = new URL(req.url ?? '/api/dsh-cost/export', 'http://localhost')
