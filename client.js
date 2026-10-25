@@ -15,6 +15,7 @@ window.__ModuleLoader__.load({
   id: 'dsh-cost',
   factory(require) {
     const React = require('react')
+    const { createPortal } = require('react-dom')
     const h = React.createElement
 
     const STYLE_ID = 'dsh-cost-style'
@@ -56,6 +57,29 @@ window.__ModuleLoader__.load({
 .dsh-cost-turn summary { cursor: pointer; color: var(--dsw-alias-label-tertiary, rgba(232, 238, 250, 0.55)); user-select: none; }
 .dsh-cost-turn summary:hover { color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72)); }
 .dsh-cost-turn-row { padding: 2px 0; overflow-wrap: anywhere; color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72)); font-variant-numeric: tabular-nums; }
+.dsh-cost-alert {
+  position: fixed;
+  top: calc(var(--dsh-frame-chrome-top, var(--dsh-frame-top-clearance, 0px)) + 16px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border: 1px solid var(--dsw-alias-border-l1, transparent);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-2, #1d232e);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-primary);
+  white-space: nowrap;
+}
+.dsh-cost-alert button { border: none; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; font-size: 12px; padding: 0; }
+.dsh-cost-alert button:hover { color: var(--dsw-alias-label-primary); }
+.dsh-cost-badge.action { cursor: pointer; user-select: none; border: none; }
+.dsh-cost-badge.action:hover { color: var(--dsw-alias-label-primary); background: var(--dsw-alias-interactive-bg-hover); }
 .dsh-cost-section { display: flex; flex-direction: column; gap: 16px; padding: 4px 2px 24px; font-size: 13px; color: var(--dsw-alias-label-primary); }
 .dsh-cost-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 @media (max-width: 1023px) { .dsh-cost-cards { grid-template-columns: 1fr; } }
@@ -302,6 +326,37 @@ window.__ModuleLoader__.load({
           : null)
     }
 
+    /* -- 峰谷切换提醒（fixed 覆盖层 portal 到 body，防祖先链裁剪） ------ */
+
+    let lastAlertedSwitch = 0
+
+    function PeakAlert() {
+      const state = useCostState()
+      const [visible, setVisible] = React.useState(false)
+      const [message, setMessage] = React.useState('')
+      React.useEffect(() => {
+        const alerts = state?.alerts
+        const nextSwitchAtMs = state?.peak?.nextSwitchAtMs
+        if (!alerts?.peakEnabled || !nextSwitchAtMs) return
+        const lead = (alerts.leadMinutes ?? 2) * 60_000
+        const remaining = nextSwitchAtMs - Date.now()
+        if (remaining > lead || remaining < 0) return
+        if (lastAlertedSwitch === nextSwitchAtMs) return
+        lastAlertedSwitch = nextSwitchAtMs
+        const time = new Date(nextSwitchAtMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        const text = state.peak.nextIsPeak ? `即将进入峰时计价（${time}）` : `即将进入谷时计价（${time}）`
+        setMessage(text)
+        setVisible(true)
+        if (alerts.notify) {
+          try { new Notification('dsh-cost 峰谷计价', { body: text }) } catch { /* 权限未授予则忽略 */ }
+        }
+      }, [state])
+      if (!visible) return null
+      return createPortal(h('div', { className: 'dsh-cost-alert' },
+        h('span', null, message),
+        h('button', { type: 'button', onClick: () => setVisible(false) }, '知道了')), document.body)
+    }
+
     /* -- 界面四：设置页「费用」分节 ------------------------------------ */
 
     function BudgetCard({ state }) {
@@ -379,6 +434,16 @@ window.__ModuleLoader__.load({
       if (Array.isArray(state?.unmatched) && state.unmatched.length > 0) {
         footerBits.push(h('span', { className: 'dsh-cost-badge', key: 'unmatched', title: state.unmatched.join(', ') }, `${state.unmatched.length} 个模型按默认档计费`))
       }
+      const downloadExport = (format) => {
+        const link = document.createElement('a')
+        link.href = `${ENDPOINT}/export?format=${format}`
+        link.download = ''
+        document.body.appendChild(link)
+        link.click()
+        link.remove()
+      }
+      footerBits.push(h('button', { className: 'dsh-cost-badge action', key: 'export-json', title: '导出全部费用记录（JSON）', onClick: () => downloadExport('json') }, '导出 JSON'))
+      footerBits.push(h('button', { className: 'dsh-cost-badge action', key: 'export-csv', title: '导出日汇总（CSV）', onClick: () => downloadExport('csv') }, '导出 CSV'))
       return h('div', { className: 'dsh-cost-section' },
         h(BudgetCard, { state }),
         cards,
@@ -414,6 +479,11 @@ window.__ModuleLoader__.load({
           id: 'dsh-cost-today',
           order: 3,
         }, TodayCost))
+        ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
+          name: 'sidebar.footer.action',
+          id: 'dsh-cost-peak-alert',
+          order: 2,
+        }, PeakAlert))
         ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section',
           id: 'dsh-cost',

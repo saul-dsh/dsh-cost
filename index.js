@@ -252,7 +252,7 @@ const localDayKey = (atMs) => {
 }
 
 function createLedger(retentionDays) {
-  let state = { version: 1, days: {} }
+  let state = { version: 1, days: {}, imported: {} }
   let dirty = false
   let flushTimer = null
 
@@ -302,6 +302,23 @@ function createLedger(retentionDays) {
     load,
     flushSync,
     dispose() { if (flushTimer) { clearTimeout(flushTimer); flushTimer = null } flushSync() },
+    /** 回填游标：该会话日志已覆盖到的事件时刻（实时记账同样推进，幂等切割）。 */
+    importedAt(sessionKey) {
+      return state.imported?.[sessionKey] ?? 0
+    },
+    markImported(sessionKey, atMs) {
+      if (!state.imported) state.imported = {}
+      const current = state.imported[sessionKey] ?? 0
+      if (atMs <= current) return false
+      state.imported[sessionKey] = atMs
+      // 裁剪：只保留最近 500 个会话的游标。
+      const keys = Object.keys(state.imported)
+      if (keys.length > 500) {
+        for (const key of keys.slice(0, keys.length - 500)) delete state.imported[key]
+      }
+      scheduleFlush()
+      return true
+    },
     /** 累加一次模型调用的用量与费用。 */
     account({ sessionId, model, buckets, cost, atMs }) {
       const day = dayOf(atMs)
@@ -319,11 +336,169 @@ function createLedger(retentionDays) {
         const session = day.sessions[sessionId] ?? (day.sessions[sessionId] = { ...zeroBuckets(), calls: 0, cost: 0, at: 0 })
         addTo(session)
         session.at = Math.max(session.at, atMs)
+        // 回填切割游标同步推进：回填只补「游标之后」的日志事件，幂等不重复。
+        if (!state.imported) state.imported = {}
+        if (atMs > (state.imported[sessionId] ?? 0)) state.imported[sessionId] = atMs
       }
       scheduleFlush()
     },
     snapshot() { return state },
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* 历史回填（cost-meter backfill 同思路：重放会话日志的 usage 事件）      */
+/* ------------------------------------------------------------------ */
+
+const SESSIONS_ROOT = join(homedir(), '.dsh', 'sessions')
+/** 单日志解压上限（大会话整串解压占内存，超限跳过并留痕）。 */
+const BACKFILL_MAX_LOG_BYTES = 64 * 1024 * 1024
+const num = (value) => { const n = Number(value); return Number.isFinite(n) && n > 0 ? n : 0 }
+
+/** 多帧 zstd（追加写每帧独立）：按魔数切段逐帧解压，坏帧跳过。 */
+async function decompressSessionLog(file) {
+  const info = await stat(file).catch(() => null)
+  if (!info || info.size > BACKFILL_MAX_LOG_BYTES) return null
+  if (file.endsWith('.zstd')) {
+    const zlib = await import('node:zlib')
+    if (typeof zlib.zstdDecompressSync !== 'function') return null
+    const buf = await readFile(file)
+    const idxs = [0]
+    for (let i = 4; i <= buf.length - 4; i += 1) {
+      if (buf[i] === 0x28 && buf[i + 1] === 0xB5 && buf[i + 2] === 0x2F && buf[i + 3] === 0xFD) idxs.push(i)
+    }
+    let out = ''
+    for (let k = 0; k < idxs.length; k += 1) {
+      try { out += zlib.zstdDecompressSync(buf.subarray(idxs[k], idxs[k + 1] ?? buf.length)).toString('utf8') } catch { /* 截断/坏帧跳过 */ }
+    }
+    return out
+  }
+  return readFile(file, 'utf8')
+}
+
+/** 目录内最新的会话日志（版本号最大、zstd 优先）。 */
+async function pickSessionLog(dir) {
+  const entries = await readdir(dir).catch(() => [])
+  const logs = entries.filter((name) => /^session(\.v\d+)?\.jsonl(\.zstd)?$/.test(name))
+  if (logs.length === 0) return null
+  logs.sort((a, b) => {
+    const versionOf = (name) => Number((name.match(/\.v(\d+)\./) ?? [])[1] ?? 0)
+    const zstdOf = (name) => (name.endsWith('.zstd') ? 1 : 0)
+    return (versionOf(a) - versionOf(b)) || (zstdOf(a) - zstdOf(b))
+  })
+  return join(dir, logs[logs.length - 1])
+}
+
+/**
+ * 重放会话事件流 → 用量样本（cost-meter replaySessionRecords 核心子集）：
+ * request/header 切换当前路由；usage 取自 assistant/chunk(usage 块) /
+ * assistant/message(data.usage) / compaction/summary，按「回合位置 + 五桶
+ * 指纹」去重（同一步的 chunk 与 message 双份只记一次，retry 用量不同照记）；
+ * 只取游标之后的事件（与实时计量幂等切割）。
+ */
+function samplesFromEvents(events, cursorAtMs) {
+  let provider = 'deepseek'
+  let model = 'default'
+  let sessionId = ''
+  const seen = new Set()
+  const samples = []
+  for (const event of events) {
+    if (event.type === 'request/header') {
+      const header = event.data?.header?.config
+      if (typeof header?.model === 'string' && header.model) model = header.model
+      if (typeof header?.provider === 'string' && header.provider) provider = header.provider
+      continue
+    }
+    if (event.type === 'session' && typeof event.id === 'string' && !sessionId) sessionId = event.id
+    let usage = null
+    let positionKey = ''
+    if (event.type === 'assistant/chunk' && event.data?.chunk?.type === 'usage' && event.data.chunk.usage != null) {
+      usage = event.data.chunk.usage
+      positionKey = `s:${num(event.data?.turn)}:${num(event.data?.step)}`
+    } else if (event.type === 'assistant/message' && event.data?.usage != null) {
+      usage = event.data.usage
+      positionKey = `s:${num(event.data?.turn)}:${num(event.data?.step)}`
+      const source = event.data?.message?.source
+      if (typeof source?.model === 'string' && source.model) model = source.model
+      if (typeof source?.provider === 'string' && source.provider) provider = source.provider
+    } else if (event.type === 'compaction/summary' && event.data?.usage != null) {
+      usage = event.data.usage
+      positionKey = `c:${event.seq ?? ''}`
+    } else {
+      continue
+    }
+    const atMs = Number(event.time)
+    if (!Number.isFinite(atMs) || atMs <= 0 || atMs <= cursorAtMs) continue
+    const buckets = {
+      input: num(usage.inputTokens),
+      output: num(usage.outputTokens),
+      cacheRead: num(usage.cacheReadTokens),
+      cacheWrite: num(usage.cacheWriteTokens),
+      reasoning: num(usage.reasoningTokens),
+    }
+    const fingerprint = `${positionKey}|${buckets.input}|${buckets.output}|${buckets.cacheRead}|${buckets.cacheWrite}|${buckets.reasoning}`
+    if (seen.has(fingerprint)) continue
+    seen.add(fingerprint)
+    samples.push({ provider, model, buckets, atMs })
+  }
+  return { sessionId, samples }
+}
+
+/**
+ * 扫描全部会话日志回填历史（boot 后延迟触发；游标幂等，可重复执行）。
+ * 回填只进聚合账本，不写 journal（回合明细只覆盖实时期）。
+ */
+async function runBackfill(ledger, priceEntryFor) {
+  const workspaces = await readdir(SESSIONS_ROOT, { withFileTypes: true }).catch(() => [])
+  let touchedSessions = 0
+  let importedCalls = 0
+  for (const workspace of workspaces) {
+    if (!workspace.isDirectory()) continue
+    const workspaceDir = join(SESSIONS_ROOT, workspace.name)
+    const sessionDirs = await readdir(workspaceDir, { withFileTypes: true }).catch(() => [])
+    for (const sessionDir of sessionDirs) {
+      if (!sessionDir.isDirectory()) continue
+      const logFile = await pickSessionLog(join(workspaceDir, sessionDir.name))
+      if (!logFile) continue
+      try {
+        const text = await decompressSessionLog(logFile)
+        if (text === null) continue
+        const events = []
+        for (const line of text.split('\n')) {
+          if (!line) continue
+          try { events.push(JSON.parse(line)) } catch { /* 半行跳过 */ }
+        }
+        const sessionKey = `${workspace.name}/${sessionDir.name}`
+        const { sessionId, samples } = samplesFromEvents(events, ledger.importedAt(sessionKey))
+        let maxAt = 0
+        for (const sample of samples) {
+          const entry = priceEntryFor(sample.model)
+          if (!entry) continue
+          const cost = costOfBuckets(sample.buckets, tierFor(entry, sample.atMs, isPeakAt(sample.atMs)))
+          ledger.account({ sessionId, model: sample.model, buckets: sample.buckets, cost, atMs: sample.atMs })
+          maxAt = Math.max(maxAt, sample.atMs)
+          importedCalls += 1
+        }
+        if (maxAt > 0 && ledger.markImported(sessionKey, maxAt)) touchedSessions += 1
+        // 让出事件循环：几百个会话的解压不能卡住宿主启动。
+        await new Promise((resolve) => setImmediate(resolve))
+      } catch (error) {
+        void report(`backfill ${sessionDir.name} failed: ${String(error?.message ?? error).slice(0, 160)}`)
+      }
+    }
+  }
+  if (importedCalls > 0) void report(`backfill done: +${importedCalls} calls across ${touchedSessions} sessions`)
+  else void report('backfill done: nothing new')
+}
+
+/** 下一次峰谷状态翻转时刻（48h 内逐分钟扫描；周末/节假日边界自然覆盖）。 */
+function nextPeakSwitch(now) {
+  const current = isPeakAt(now)
+  const start = Math.floor(now / 60_000) * 60_000 + 60_000
+  for (let ms = start; ms <= now + 48 * 3_600_000; ms += 60_000) {
+    if (isPeakAt(ms) !== current) return { atMs: ms, isPeak: isPeakAt(ms) }
+  }
+  return null
 }
 
 /* ------------------------------------------------------------------ */
@@ -343,12 +518,16 @@ export const Config = Schema.object({
   budgetEnabled: Schema.boolean().default(false).description('启用预算'),
   budgetAmount: Schema.number().default(50).description('预算金额（CNY）'),
   budgetPeriod: Schema.union(['day', 'month', 'all']).default('month').description('预算周期'),
+  backfillEnabled: Schema.boolean().default(true).description('启动时回填历史会话费用'),
+  peakAlertEnabled: Schema.boolean().default(false).description('峰谷切换前提醒'),
+  peakAlertLeadMinutes: Schema.number().default(2).description('峰谷切换提前量（分钟，1-30）'),
+  peakAlertNotify: Schema.boolean().default(false).description('同时发送系统通知'),
 })
 
 export function apply(ctx, config) {
   if (!config.enabled) return
 
-  void report(`server boot v0.2.0 pid=${process.pid} retention=${config.retentionDays} rate=${config.exchangeRate} budget=${config.budgetEnabled ? `${config.budgetAmount}/${config.budgetPeriod}` : 'off'}`)
+  void report(`server boot v0.5.0 pid=${process.pid} retention=${config.retentionDays} rate=${config.exchangeRate} budget=${config.budgetEnabled ? `${config.budgetAmount}/${config.budgetPeriod}` : 'off'} backfill=${config.backfillEnabled ? 'on' : 'off'}`)
 
   const ledger = createLedger(config.retentionDays)
   ledger.load()
@@ -356,6 +535,13 @@ export function apply(ctx, config) {
 
   const admitUsage = createUsageDeduper()
   const journal = createJournal()
+
+  // 历史回填：boot 后延迟 3s（避开宿主启动高峰），游标幂等可重复执行。
+  if (config.backfillEnabled) {
+    const backfillTimer = setTimeout(() => { void runBackfill(ledger, priceEntryFor).catch((error) => { void report(`backfill crashed: ${String(error?.message ?? error).slice(0, 200)}`) }) }, 3000)
+    backfillTimer.unref?.()
+    ctx.effect(() => () => clearTimeout(backfillTimer), 'dsh-cost: backfill timer')
+  }
 
   /** 深度标记：存在即「已知会、不需要再入账」的 llm 流（嵌套排除）。 */
   const llmDepth = new AsyncLocalStorage()
@@ -505,7 +691,7 @@ export function apply(ctx, config) {
           send(200, {
             serverNow: now,
             display: { currency: 'CNY', rate: config.exchangeRate },
-            peak: { isPeak: isPeakAt(now), windows: PEAK_WINDOWS },
+            peak: { isPeak: isPeakAt(now), windows: PEAK_WINDOWS, nextSwitchAtMs: nextPeakSwitch(now)?.atMs ?? null, nextIsPeak: nextPeakSwitch(now)?.isPeak ?? null },
             today: todayKey in snap.days ? summarize(snap.days[todayKey]) : null,
             month,
             total: summarize(total),
@@ -516,6 +702,11 @@ export function apply(ctx, config) {
             sessions: sessions.slice(0, 20),
             unmatched: [...unmatchedModels],
             streamAlive: streamArmed,
+            alerts: {
+              peakEnabled: config.peakAlertEnabled === true,
+              leadMinutes: Math.min(30, Math.max(1, Math.round(config.peakAlertLeadMinutes ?? 2))),
+              notify: config.peakAlertNotify === true,
+            },
           })
           return
         }
@@ -537,6 +728,29 @@ export function apply(ctx, config) {
           const to = Number(url.searchParams.get('to') ?? Number.MAX_SAFE_INTEGER)
           if (!sessionId || !Number.isFinite(from) || !Number.isFinite(to)) { send(400, { error: 'missing session/from/to' }); return }
           send(200, await journal.range({ sessionId, from, to }))
+          return
+        }
+
+        // 导出：全量 JSON（含日/模型/会话聚合）或日汇总 CSV。
+        if (path === '/export' && req.method === 'GET') {
+          const url = new URL(req.url ?? '/api/dsh-cost/export', 'http://localhost')
+          const snap = ledger.snapshot()
+          if ((url.searchParams.get('format') ?? 'json') === 'csv') {
+            const lines = ['date,input,output,cache_read,cache_write,reasoning,calls,cost_usd']
+            for (const key of Object.keys(snap.days).sort()) {
+              const day = snap.days[key]
+              lines.push([key, day.input ?? 0, day.output ?? 0, day.cacheRead ?? 0, day.cacheWrite ?? 0, day.reasoning ?? 0, day.calls ?? 0, (day.cost ?? 0).toFixed(6)].join(','))
+            }
+            res.statusCode = 200
+            res.setHeader('content-type', 'text/csv; charset=utf-8')
+            res.setHeader('content-disposition', 'attachment; filename="dsh-cost-days.csv"')
+            res.end(lines.join('\n'))
+            return
+          }
+          res.statusCode = 200
+          res.setHeader('content-type', 'application/json')
+          res.setHeader('content-disposition', 'attachment; filename="dsh-cost-ledger.json"')
+          res.end(JSON.stringify({ exportedAt: Date.now(), display: { currency: 'CNY', rate: config.exchangeRate }, days: snap.days }))
           return
         }
 

@@ -2,6 +2,29 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0] - 2026-10-25
+
+### 历史回填 + 峰谷提醒 + 导出（cost-meter 批量搬运第二批）
+
+- **历史回填**（cost-meter backfill 同思路）：boot 后 3s 扫描
+  `~/.dsh/sessions/<工作区>/<会话>/session[.vN].jsonl[.zstd]`，多帧 zstd
+  解压后重放用量事件（`request/header` 切路由；`assistant/chunk` 的 usage
+  块、`assistant/message` 的 data.usage、`compaction/summary` 三类来源；
+  「回合位置 + 五桶指纹」去重——同一步的 chunk 与 message 双份只记一次），
+  按事件时刻走历史档位计价入账。**游标幂等**：ledger.imported 按会话记录
+  已覆盖时刻，实时记账同步推进，回填只补游标之后的事件，永不重复入账。
+  回填只进聚合账本不写 journal；64MB 以上日志跳过；配置 `backfillEnabled`
+  可关。
+- **峰谷切换提醒**（cost-meter peak-alert 简化版）：配置
+  `peakAlertEnabled` / `peakAlertLeadMinutes`(1-30，默认 2) /
+  `peakAlertNotify`；`/state` 下发下一次切换时刻（48h 逐分钟扫描，周末与
+  节假日边界自然覆盖，单测验证工作日/跨周末两例）；进入提前量窗口时顶部
+  居中弹卡（portal 到 body 防祖先链裁剪），可同时发系统通知；每个切换点
+  只提醒一次。
+- **导出**：设置 → 费用新增「导出 JSON」（全量日/模型/会话聚合）与
+  「导出 CSV」（日汇总），`GET /api/dsh-cost/export` 下载。
+- `/state.peak` 新增 `nextSwitchAtMs` / `nextIsPeak` 与 `alerts` 配置下发。
+
 ## [0.4.0] - 2026-10-25
 
 ### 新增：每轮对话尾部的回合费用（搬运 dsh-cost-meter TurnCost）
