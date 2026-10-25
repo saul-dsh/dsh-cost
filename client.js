@@ -72,10 +72,6 @@ window.__ModuleLoader__.load({
   font-variant-numeric: tabular-nums;
 }
 .dsh-cost-sidebar.warn .dsh-cost-sidebar-value { color: var(--dsw-alias-state-warn-primary); }
-.dsh-cost-turn { margin-top: 6px; font-size: 12px; line-height: 20px; }
-.dsh-cost-turn summary { cursor: pointer; color: var(--dsw-alias-label-tertiary, rgba(232, 238, 250, 0.55)); user-select: none; }
-.dsh-cost-turn summary:hover { color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72)); }
-.dsh-cost-turn-row { padding: 2px 0; overflow-wrap: anywhere; color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72)); font-variant-numeric: tabular-nums; }
 .dsh-cost-alert {
   position: fixed;
   top: calc(var(--dsh-frame-chrome-top, var(--dsh-frame-top-clearance, 0px)) + 16px);
@@ -376,37 +372,26 @@ window.__ModuleLoader__.load({
       h('span', { className: 'dsh-cost-sidebar-value' }, moneyOf(state, today?.cost ?? 0)))
     }
 
-    /* -- 界面三：回合费用（turnTail 槽位，cost-meter TurnCost 同款） ---- */
+    /* -- 回合边界感知（turnTail 槽位，隐形数据载体） -------------------- */
 
     const TURN_BUCKET_NAMES = { input: '输入', output: '输出', cacheRead: '缓存读取', cacheWrite: '缓存写入', reasoning: '推理' }
 
+    /**
+     * 用户要求去掉回合尾部的可见费用行（0.6.1）；此组件退化为隐形载体：
+     * 每回合渲染一个 display:none 的节点，把宿主给的回合时间边界写到
+     * dataset——动作行的「费用」按钮（用量旁）靠它把弹卡对到正确的回合。
+     */
     function TurnCost(props) {
-      const state = useCostState()
       const turn = props.turn
-      const sessionId = props.sessionId
-      const [value, setValue] = React.useState(null)
       const start = turn?.start?.time
       const end = turn?.end?.time
-      React.useEffect(() => {
-        let active = true
-        setValue(null)
-        if (!sessionId || start == null || end == null) return
-        fetch(`${ENDPOINT}/turn?session=${encodeURIComponent(sessionId)}&from=${start}&to=${end}`, { cache: 'no-store' })
-          .then((res) => (res.ok ? res.json() : null))
-          .then((data) => { if (active && data) setValue(data) })
-          .catch(() => {})
-        return () => { active = false }
-      }, [sessionId, start, end])
       if (start == null || end == null) return null
-      // 回合边界写到 DOM：动作行费用按钮从同回合的 details 读回窗口。
-      return h('details', { className: 'dsh-cost-turn', 'data-turn-from': String(start), 'data-turn-to': String(end) },
-        h('summary', null,
-          '本轮费用',
-          value ? (value.found ? ` ≈ ${moneyOf(state, value.cost)}` : '') : ''),
-        value && value.found
-          ? h('div', null, value.rows.map((row, index) => h('div', { className: 'dsh-cost-turn-row', key: index },
-            `${String(row.model ?? '').replace(/^deepseek-/, '')} · ${TURN_BUCKET_NAMES[row.bucket] ?? row.bucket}：${Number(row.tokens).toLocaleString()} tok · ${moneyOf(state, row.cost)}`)))
-          : null)
+      return h('span', {
+        className: 'dsh-cost-turn-data',
+        'data-turn-from': String(start),
+        'data-turn-to': String(end),
+        style: { display: 'none' },
+      })
     }
 
     /* -- 峰谷切换提醒（fixed 覆盖层 portal 到 body，防祖先链裁剪） ------ */
@@ -444,12 +429,12 @@ window.__ModuleLoader__.load({
 
     const usageAnchors = { observer: null, scanning: false, pop: null }
 
-    /** 从「用量」按钮向上找同回合的 turnTail details（限深，宁缺毋错）。 */
+    /** 从「用量」按钮向上找同回合的隐形边界载体（限深，宁缺毋错）。 */
     function findTurnDetails(usageButton) {
       let level = usageButton.parentElement
       for (let depth = 0; depth < 6 && level; depth += 1) {
-        const details = level.querySelector?.('.dsh-cost-turn[data-turn-from]')
-        if (details) return details
+        const marker = level.querySelector?.('.dsh-cost-turn-data[data-turn-from]')
+        if (marker) return marker
         level = level.parentElement
       }
       return null
@@ -536,7 +521,8 @@ window.__ModuleLoader__.load({
           event.stopPropagation()
           openTurnCostPop(anchor)
         })
-        button.insertAdjacentElement('beforebegin', anchor)
+        // 插到「用量」按钮右侧（用户指定：用量在左、费用在右）。
+        button.insertAdjacentElement('afterend', anchor)
         // 金额异步补：同回合 /turn 已被 turnTail 查过，这里独立补一次。
         fetch(`${ENDPOINT}/turn?session=${encodeURIComponent(currentSessionId)}&from=${from}&to=${to}`, { cache: 'no-store' })
           .then((res) => (res.ok ? res.json() : null))
@@ -682,6 +668,7 @@ window.__ModuleLoader__.load({
           id: 'dsh-cost-session',
           order: 90,
         }, SessionIdSensor))
+        // 隐形回合边界载体：动作行「费用」按钮的弹卡按回合对齐靠它（0.6.1 起不再渲染可见费用行）。
         ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
           name: 'conversation.chat.turnTail',
           id: 'dsh-cost-turn',
