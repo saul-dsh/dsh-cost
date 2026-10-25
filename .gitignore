@@ -1,3 +1,6 @@
 node_modules/
 *.log
 .mimosa/
+
+# 官方定价页调试样本
+_pricing.html

@@ -354,6 +354,17 @@ function createLedger(retentionDays) {
       state.journalOffset = offset
       scheduleFlush()
     },
+    /** 官方同步的现行价格（flash/pro 峰谷档）与汇率——覆盖内置表，历史档不动。 */
+    livePrices() { return state.live?.prices ?? null },
+    setLivePrices(tiers) {
+      state.live = { ...(state.live ?? {}), prices: tiers }
+      scheduleFlush()
+    },
+    liveExchangeRate() { return state.live?.exchangeRate ?? null },
+    setExchangeRate(rate, fetchedAt) {
+      state.live = { ...(state.live ?? {}), exchangeRate: { rate, fetchedAt } }
+      scheduleFlush()
+    },
     /** 累加一次模型调用的用量与费用。 */
     account({ sessionId, model, buckets, cost, atMs }) {
       const day = dayOf(atMs)
@@ -548,6 +559,63 @@ function nextPeakSwitch(now) {
     if (isPeakAt(ms) !== current) return { atMs: ms, isPeak: isPeakAt(ms) }
   }
   return null
+}
+
+/** 官方定价页（预渲染 SSR）解析 → flash/pro 峰谷八字段（USD/1M）。 */
+const OFFICIAL_PRICING_URL = 'https://api-docs.deepseek.com/quick_start/pricing/'
+
+function parseOfficialPricing(html) {
+  const text = html.replace(/<script[\s\S]*?<\/script>/g, ' ').replace(/<[^>]*>/g, ' ')
+    .replace(/&amp;/g, '&').replace(/\s+/g, ' ')
+  const startIdx = text.indexOf('PRICING')
+  const endIdx = text.indexOf('Concurrency Limit', startIdx)
+  if (startIdx < 0 || endIdx < 0) throw new Error('pricing section not found')
+  const section = text.slice(startIdx, endIdx)
+  const nums = [...section.matchAll(/\$([0-9.]+)/g)].map((m) => Number(m[1]))
+  if (nums.length < 12) throw new Error(`pricing layout changed: expected 12 rates, got ${nums.length}`)
+  // 页面顺序（deepseek-flash | deepseek-v4-pro 两列）：
+  // CACHE HIT off(a,b) peak(c,d) · CACHE MISS off(e,f) peak(g,h) · OUTPUT off(i,j) peak(k,l)
+  const [fhOff, phOff, fhPk, phPk, fmOff, pmOff, fmPk, pmPk, foOff, poOff, foPk, poPk] = nums
+  const pair = (flash, pro, label) => {
+    if (!(flash > 0 && pro > 0)) throw new Error(`pricing layout changed: invalid ${label}`)
+    return { flash, pro }
+  }
+  return {
+    fetchedAt: Date.now(),
+    currency: 'USD',
+    cacheHit: { offPeak: pair(fhOff, phOff, 'cacheHit.offPeak'), peak: pair(fhPk, phPk, 'cacheHit.peak') },
+    cacheMiss: { offPeak: pair(fmOff, pmOff, 'cacheMiss.offPeak'), peak: pair(fmPk, pmPk, 'cacheMiss.peak') },
+    output: { offPeak: pair(foOff, poOff, 'output.offPeak'), peak: pair(foPk, poPk, 'output.peak') },
+  }
+}
+
+async function fetchOfficialPricing() {
+  const res = await fetch(OFFICIAL_PRICING_URL, { headers: { 'user-agent': 'dsh-cost' }, signal: AbortSignal.timeout(15_000) })
+  if (!res.ok) throw new Error(`official pricing page HTTP ${res.status}`)
+  return parseOfficialPricing(await res.text())
+}
+
+/** 汇率（USD→CNY），frankfurter.dev 免钥公开端点。 */
+async function fetchExchangeRate() {
+  const res = await fetch('https://api.frankfurter.dev/v1/latest?base=USD&symbols=CNY', { signal: AbortSignal.timeout(10_000) })
+  if (!res.ok) throw new Error(`frankfurter HTTP ${res.status}`)
+  const data = await res.json()
+  const rate = Number(data?.rates?.CNY)
+  if (!(rate > 0)) throw new Error('frankfurter returned no CNY rate')
+  return rate
+}
+
+/** 把官方解析结果折成 tier 形状（flash/pro 各一），并校验峰=谷×2（±1%）。 */
+function tiersFromOfficial(parsed) {
+  const build = (family) => {
+    const offPeak = { cacheHit: parsed.cacheHit.offPeak[family], cacheMiss: parsed.cacheMiss.offPeak[family], output: parsed.output.offPeak[family] }
+    const peak = { cacheHit: parsed.cacheHit.peak[family], cacheMiss: parsed.cacheMiss.peak[family], output: parsed.output.peak[family] }
+    for (const key of Object.keys(offPeak)) {
+      if (Math.abs(peak[key] - offPeak[key] * 2) > offPeak[key] * 0.011) throw new Error(`peak != 2×offPeak for ${family}.${key} (official layout changed)`)
+    }
+    return { offPeak, peak: double(offPeak) }
+  }
+  return { fetchedAt: parsed.fetchedAt, currency: parsed.currency, flash: build('flash'), pro: build('pro') }
 }
 
 /* ------------------------------------------------------------------ */
