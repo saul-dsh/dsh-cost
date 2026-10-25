@@ -2,6 +2,18 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.0] - 2026-10-25
+
+### 新增
+
+- **状态行费用 pill**：挂在 `conversation.composer.dock`，`id: cost`、`order: 2`，排在 dsh 自带的 `activity`(0) 和 `usage`(1) 之后，样式完全对齐原生 pill（padding 1/8、`--dsw-radius-sm`、12px、tabular-nums、悬停淡底）。
+- **费用按来源分账**：`account()` 增加 `source` 字段，journal 落盘时带上，`day.bySource` 累计。弹卡分三组显示：对话 / 提示词增强 / 跟进建议。
+- **`/calls` 增强**：在原 `journal.recent()` 明细之外，额外返回全量 `total`（含 `bySource` 汇总），供弹卡头部展示。
+
+### 跨插件约定
+
+- 其它插件在发起自己的 `llm.stream` 前写 `globalThis.__dshPluginCall = { source, at }`，本插件按 5 秒窗口读回并清除。已接入：`dsh-prompt-enhancer`（`enhance`）、`dsh-followup`（`followup`）；没有标记的调用一律算 `chat`。
+
 ## [0.7.0] - 2026-10-25
 
 ### 重构：跨进程单写者账本（双进程同 boot 实锤后的正确性修复）

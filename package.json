@@ -1,6 +1,6 @@
 {
   "name": "dsh-cost",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Session cost tracking for the DeepSeek Harness (dsh): per-call token usage billed at official DeepSeek rates (peak/off-peak aware), per-day/per-model/per-session ledger, today/month/total cards, session cost chip and settings page. Bilingual-ready UI.",
   "type": "module",
   "main": "index.js",

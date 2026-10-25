@@ -283,6 +283,9 @@ function createLedger(retentionDays) {
   let state = { version: 1, days: {}, imported: {} }
   let dirty = false
   let flushTimer = null
+  /** 最近调用明细（内存，重启清空）：费用弹卡按时间倒序展示。 */
+  const RECENT_CALLS_MAX = 200
+  const recentCalls = []
 
   const load = () => {
     try {
@@ -365,15 +368,32 @@ function createLedger(retentionDays) {
       state.live = { ...(state.live ?? {}), exchangeRate: { rate, fetchedAt } }
       scheduleFlush()
     },
-    /** 累加一次模型调用的用量与费用。 */
-    account({ sessionId, model, buckets, cost, atMs }) {
+    /** 最近调用明细，时间倒序（费用弹卡用）。 */
+    recentCalls(limit = 50) {
+      return recentCalls.slice(-Math.max(1, limit)).reverse()
+    },
+    /** 累加一次模型调用的用量与费用。source 区分对话 / 增强 / 建议生成。 */
+    account({ sessionId, model, buckets, cost, atMs, source }) {
       const day = dayOf(atMs)
+      const src = typeof source === 'string' && source ? source : 'chat'
       const addTo = (target) => {
         for (const key of Object.keys(zeroBuckets())) target[key] += buckets[key] ?? 0
         target.calls += 1
         target.cost += cost
       }
       addTo(day)
+      // 按来源分账，费用弹卡才能把「增强」和「对话」分开显示。
+      const bySource = day.bySource ?? (day.bySource = {})
+      const srcEntry = bySource[src] ?? (bySource[src] = { ...zeroBuckets(), calls: 0, cost: 0 })
+      addTo(srcEntry)
+      // 最近调用明细（内存环形缓冲，重启清空；历史总额仍走 days）。
+      recentCalls.push({
+        at: atMs, session: sessionId || '', model: model || '', source: src,
+        tokens: (buckets.input ?? 0) + (buckets.output ?? 0) + (buckets.cacheRead ?? 0) + (buckets.cacheWrite ?? 0),
+        input: buckets.input ?? 0, output: buckets.output ?? 0,
+        cacheRead: buckets.cacheRead ?? 0, cost,
+      })
+      if (recentCalls.length > RECENT_CALLS_MAX) recentCalls.splice(0, recentCalls.length - RECENT_CALLS_MAX)
       if (model) {
         const entry = day.byModel[model] ?? (day.byModel[model] = { ...zeroBuckets(), calls: 0, cost: 0 })
         addTo(entry)
@@ -717,7 +737,7 @@ export function apply(ctx, config) {
         if (!row || !Number.isFinite(row.at) || !Number.isFinite(row.cost) || !row.model) continue
         const buckets = { input: row.input ?? 0, output: row.output ?? 0, cacheRead: row.cacheRead ?? 0, cacheWrite: row.cacheWrite ?? 0, reasoning: row.reasoning ?? 0 }
         if (!ingestDedup(`${row.session ?? ''}|${row.model}`, buckets, row.at)) continue
-        ledger.account({ sessionId: row.session, model: row.model, buckets, cost: row.cost, atMs: row.at })
+        ledger.account({ sessionId: row.session, model: row.model, buckets, cost: row.cost, atMs: row.at, source: row.source })
         // +60s 余量：日志事件记的是消息完成时刻，晚于实时流发起时刻；
         // 游标盖住整个调用时长，防回填重放同一条。
         if (row.session) ledger.markImported(row.session, row.at + 60_000)
@@ -748,6 +768,23 @@ export function apply(ctx, config) {
 
   /** 深度标记：存在即「已知会、不需要再入账」的 llm 流（嵌套排除）。 */
   const llmDepth = new AsyncLocalStorage()
+
+  /**
+   * 跨插件的调用来源标记。prompt-enhancer / followup 在发起自己的
+   * llm.stream 前写 globalThis.__dshPluginCall，这里按 5 秒窗口读回：
+   * 落在窗口内算它们的调用，否则一律算对话。读一次就清，避免串到下一次。
+   */
+  const CALL_SOURCE_TTL_MS = 5000
+  function callSource() {
+    const marker = globalThis.__dshPluginCall
+    if (marker && typeof marker.at === 'number' && Date.now() - marker.at < CALL_SOURCE_TTL_MS) {
+      const source = typeof marker.source === 'string' && marker.source ? marker.source : 'chat'
+      globalThis.__dshPluginCall = undefined
+      return source
+    }
+    return 'chat'
+  }
+
   const unmatchedModels = new Set()
   let streamArmed = false
   let accountCount = 0
@@ -822,6 +859,7 @@ export function apply(ctx, config) {
                   rows: bucketRows(buckets, tier),
                   cost,
                   peak,
+                  source: callSource(),
                 })
                 accountCount += 1
                 // 采样留痕（前 10 条全记，之后 1/20），足以判定通路与发现异常。
@@ -928,8 +966,23 @@ export function apply(ctx, config) {
           const url = new URL(req.url ?? '/api/dsh-cost/calls', 'http://localhost')
           const sessionId = url.searchParams.get('session') ?? ''
           const day = url.searchParams.get('day') ?? ''
-          const limit = Number(url.searchParams.get('limit') ?? 20)
-          send(200, { calls: await journal.recent({ sessionId, day, limit }) })
+          const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') ?? 20)))
+          // 全量按来源汇总（对话 / 增强 / 建议生成），供状态行费用弹卡分组显示。
+          const snap = await ledgerSnapshotFresh()
+          const bySource = {}
+          let totalCost = 0
+          let totalCalls = 0
+          for (const key of Object.keys(snap.days)) {
+            const d = snap.days[key]
+            totalCost += d.cost ?? 0
+            totalCalls += d.calls ?? 0
+            for (const [src, entry] of Object.entries(d.bySource ?? {})) {
+              const t = bySource[src] ?? (bySource[src] = { cost: 0, calls: 0 })
+              t.cost += entry.cost ?? 0
+              t.calls += entry.calls ?? 0
+            }
+          }
+          send(200, { total: { cost: totalCost, calls: totalCalls, bySource }, calls: await journal.recent({ sessionId, day, limit }) })
           return
         }
 

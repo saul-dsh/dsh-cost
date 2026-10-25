@@ -120,6 +120,48 @@ window.__ModuleLoader__.load({
 /* 官方弹卡基准。底色照 dsh 的 macOS 档写死 0.94，不用 --dsw-specific-menu：
    Windows 默认是 rgba(67,69,74,.45)，那是给带 MenuSurface 底衬的官方菜单用的；
    插件直接 portal 到 body 没有底衬，0.45 一旦 backdrop-filter 失效就发灰糊在背景上。 */
+/* 状态行费用 pill：规格对齐 dsh 自带的 token / 缓存命中 pill（padding 1/8、
+   圆角 sm、12px、tabular-nums、悬停淡底）。 */
+.dsh-cost-pill-anchor {
+  display: inline-flex;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 20px;
+}
+.dsh-cost-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 8px;
+  border: none;
+  border-radius: var(--dsw-radius-sm, 8px);
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary, rgba(232, 238, 250, 0.5));
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.dsh-cost-pill:hover,
+.dsh-cost-pill[aria-expanded="true"] {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.08));
+  color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72));
+}
+.dsh-cost-pill svg { width: 14px; height: 14px; flex: none; }
+
+/* 弹卡里的来源分组与明细行 */
+.dsh-cost-src {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 11.5px;
+}
+.dsh-cost-src .name { flex: 1; color: var(--dsw-alias-label-secondary, rgba(232,238,250,.72)); }
+.dsh-cost-src .num { font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-primary, rgba(232,238,250,.92)); }
+.dsh-cost-src .cnt { color: var(--dsw-alias-label-tertiary, rgba(232,238,250,.45)); font-variant-numeric: tabular-nums; }
+
 .dsh-cost-pop {
   position: fixed;
   z-index: 1100;
@@ -637,6 +679,137 @@ body[data-ds-dark-theme] .dsh-cost-pop {
           `${row?.calls ?? 0} 次调用 · token ${(tokensOf(row) / 1000).toFixed(1)}k`))
     }
 
+    /* -- 状态行费用 pill：累计费用，点开看每笔调用（含提示词增强） ------ */
+
+    const SOURCE_LABEL = { chat: '对话', enhance: '提示词增强', followup: '跟进建议' }
+    let overviewPop = null
+
+    function closeOverviewPop(event) {
+      // 点 pill 本身不在这里关，交给按钮做 toggle；点弹卡内部也不关。
+      if (event?.target instanceof Node) {
+        if (event.target.closest?.('.dsh-cost-pill-anchor')) return
+        if (overviewPop?.contains(event.target)) return
+      }
+      overviewPop?.remove()
+      overviewPop = null
+      document.removeEventListener('click', closeOverviewPop, true)
+    }
+
+    function renderOverview(data) {
+      const state = latestState
+      const box = document.createElement('div')
+
+      const head = document.createElement('div')
+      head.className = 'dsh-cost-pop-head'
+      const title = document.createElement('span')
+      title.textContent = '费用明细'
+      const sum = document.createElement('span')
+      sum.textContent = moneyOf(state, data.total?.cost ?? 0)
+      head.append(title, sum)
+      box.appendChild(head)
+
+      const bySource = data.total?.bySource ?? {}
+      const order = ['chat', 'enhance', 'followup']
+      const keys = [
+        ...order.filter((key) => bySource[key]),
+        ...Object.keys(bySource).filter((key) => !order.includes(key)),
+      ]
+      for (const key of keys) {
+        const entry = bySource[key]
+        const row = document.createElement('div')
+        row.className = 'dsh-cost-src'
+        const name = document.createElement('span')
+        name.className = 'name'
+        name.textContent = SOURCE_LABEL[key] ?? key
+        const cnt = document.createElement('span')
+        cnt.className = 'cnt'
+        cnt.textContent = entry.calls + ' 次'
+        const num = document.createElement('span')
+        num.className = 'num'
+        num.textContent = moneyOf(state, entry.cost)
+        row.append(name, cnt, num)
+        box.appendChild(row)
+      }
+
+      const sep = document.createElement('div')
+      sep.className = 'dsh-cost-pop-head'
+      sep.style.marginTop = '8px'
+      const sepTitle = document.createElement('span')
+      sepTitle.textContent = '最近调用'
+      sep.appendChild(sepTitle)
+      box.appendChild(sep)
+
+      for (const call of (data.calls ?? []).slice(0, 20)) {
+        const row = document.createElement('div')
+        row.className = 'dsh-cost-src'
+        const time = document.createElement('span')
+        time.className = 'cnt'
+        time.textContent = new Date(call.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+        const name = document.createElement('span')
+        name.className = 'name'
+        name.textContent = (SOURCE_LABEL[call.source] ?? call.source) + ' · ' + (call.model || '—')
+        const num = document.createElement('span')
+        num.className = 'num'
+        num.textContent = moneyOf(state, call.cost)
+        row.append(time, name, num)
+        box.appendChild(row)
+      }
+      return box
+    }
+
+    async function openOverviewPop(anchor) {
+      closeOverviewPop()
+      if (!anchor) return
+      const pop = document.createElement('div')
+      pop.className = 'dsh-cost-pop'
+      pop.textContent = '加载中…'
+      document.body.appendChild(pop)
+      overviewPop = pop
+      const rect = anchor.getBoundingClientRect()
+      pop.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - 300)) + 'px'
+      pop.style.top = rect.top - 8 + 'px'
+      pop.style.transform = 'translateY(-100%)'
+      document.addEventListener('click', closeOverviewPop, true)
+      try {
+        const res = await fetch(ENDPOINT + '/calls?limit=30', { cache: 'no-store' })
+        const data = res.ok ? await res.json() : null
+        if (!overviewPop) return
+        pop.textContent = ''
+        pop.appendChild(data ? renderOverview(data) : document.createTextNode('读取失败'))
+      } catch {
+        if (overviewPop) pop.textContent = '读取失败'
+      }
+    }
+
+    /** 状态行 pill：和 token / 缓存命中同排，点开看累计费用与每笔调用。 */
+    function CostPill() {
+      useCostState()
+      const anchorRef = React.useRef(null)
+      const [open, setOpen] = React.useState(false)
+      React.useEffect(() => {
+        // 弹卡被点外部关掉时，把按钮的展开态同步回来。
+        const timer = window.setInterval(() => { setOpen(Boolean(overviewPop)) }, 200)
+        return () => window.clearInterval(timer)
+      }, [])
+      const state = latestState
+      return h('span', { className: 'dsh-cost-pill-anchor', ref: anchorRef },
+        h('button', {
+          type: 'button',
+          className: 'dsh-cost-pill',
+          'aria-expanded': open ? 'true' : 'false',
+          title: '费用明细',
+          onClick: () => {
+            if (overviewPop) { closeOverviewPop(); setOpen(false); return }
+            setOpen(true)
+            void openOverviewPop(anchorRef.current)
+          },
+        },
+        h('svg', { viewBox: '0 0 16 16', 'aria-hidden': true },
+          h('circle', { cx: 8, cy: 8, r: 6.2, fill: 'none', stroke: 'currentColor', 'stroke-width': 1.4 }),
+          h('path', { d: 'M8 4.8v3.4l2.2 1.4', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.4, 'stroke-linecap': 'round' })),
+        h('span', null, state ? moneyOf(state, state.total?.cost ?? 0) : '—')))
+    }
+
     function CostSection() {
       const state = useCostState()
       const cards = h('div', { className: 'dsh-cost-cards' },
@@ -702,6 +875,12 @@ body[data-ds-dark-theme] .dsh-cost-pop {
           order: 90,
         }, SessionIdSensor))
         // 隐形回合边界载体：动作行「费用」按钮的弹卡按回合对齐靠它（0.6.1 起不再渲染可见费用行）。
+        // 状态行费用 pill：order 2 排在 dsh 的 activity(0) / usage(1) 之后。
+        ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+          name: 'conversation.composer.dock',
+          id: 'cost',
+          order: 2,
+        }, CostPill))
         ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
           name: 'conversation.chat.turnTail',
           id: 'dsh-cost-turn',
