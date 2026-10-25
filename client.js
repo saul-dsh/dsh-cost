@@ -379,10 +379,16 @@ body[data-ds-dark-theme] .dsh-cost-pop {
     }
 
     function mountSessionAnchor() {
+      // 状态行费用改由 composer.dock 的 pill 负责：这里不但不再插新的一份，
+      // 还要把旧版本已经插进去的 .dsh-cost-statusrow 清掉，否则会显示成两行。
+      if (document.querySelector('.dsh-cost-pill-anchor')) {
+        for (const stale of document.querySelectorAll('.dsh-cost-statusrow')) stale.remove()
+        sessionAnchor.host = null
+        sessionAnchor.span = null
+        return
+      }
       // 已挂且仍在文档中：不重复锚。
       if (sessionAnchor.host?.isConnected) return
-      // 状态行已经有费用 pill 了，不再往末尾插一份，避免重复显示。
-      if (document.querySelector('.dsh-cost-pill-anchor')) return
       const row = findStatusRow()
       if (!row) {
         void clientDebug('anchor: status row not found (no visible tok/s text)')
@@ -791,6 +797,8 @@ body[data-ds-dark-theme] .dsh-cost-pop {
       const [session, setSession] = React.useState(null)
 
       React.useEffect(() => {
+        // pill 挂载即接管状态行费用：把旧版本锚定插入的那一份清掉。
+        for (const stale of document.querySelectorAll('.dsh-cost-statusrow')) stale.remove()
         // 弹卡被点外部关掉时，把按钮的展开态同步回来。
         const timer = window.setInterval(() => { setOpen(Boolean(overviewPop)) }, 200)
         return () => window.clearInterval(timer)
