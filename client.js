@@ -355,6 +355,11 @@ body[data-ds-dark-theme] .dsh-cost-pop {
      * 直接 button 子女的层——状态行由「5轮68步」「8M tok」「上下文 16%」等
      * 多个指标按钮组成，锚要插在这一层之后才是整行末尾。 */
     function findStatusRow() {
+      // 优先认宿主的 dock 容器：InputBar 里 <div data-composer-dock> 同时装
+      // composer.dock 槽位（各 pill）和 ContextMeter。比按文本 + 按钮数猜稳。
+      const dock = document.querySelector('[data-composer-dock]')
+      if (dock && dock.offsetParent !== null) return dock
+      // 兜底：老版本的文本扫描
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
       for (let node = walker.nextNode(); node; node = walker.nextNode()) {
         const text = node.textContent ?? ''
@@ -376,6 +381,8 @@ body[data-ds-dark-theme] .dsh-cost-pop {
     function mountSessionAnchor() {
       // 已挂且仍在文档中：不重复锚。
       if (sessionAnchor.host?.isConnected) return
+      // 状态行已经有费用 pill 了，不再往末尾插一份，避免重复显示。
+      if (document.querySelector('.dsh-cost-pill-anchor')) return
       const row = findStatusRow()
       if (!row) {
         void clientDebug('anchor: status row not found (no visible tok/s text)')
@@ -930,10 +937,11 @@ body[data-ds-dark-theme] .dsh-cost-pop {
           id: 'cost',
           order: 2,
         }, CostPill))
+        // order 5：dsh-followup 也注册了这个槽位且用 10，同序可能互相挤掉。
         ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
           name: 'conversation.chat.turnTail',
           id: 'dsh-cost-turn',
-          order: 10,
+          order: 5,
         }, TurnCost))
         ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
           name: 'sidebar.footer.action',
