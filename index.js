@@ -401,6 +401,9 @@ function createLedger(retentionDays) {
       if (sessionId) {
         const session = day.sessions[sessionId] ?? (day.sessions[sessionId] = { ...zeroBuckets(), calls: 0, cost: 0, at: 0 })
         addTo(session)
+        const sessionBySource = session.bySource ?? (session.bySource = {})
+        const sessionSrc = sessionBySource[src] ?? (sessionBySource[src] = { ...zeroBuckets(), calls: 0, cost: 0 })
+        addTo(sessionSrc)
         session.at = Math.max(session.at, atMs)
         // 回填切割游标同步推进：回填只补「游标之后」的日志事件，幂等不重复。
         if (!state.imported) state.imported = {}
@@ -983,6 +986,33 @@ export function apply(ctx, config) {
             }
           }
           send(200, { total: { cost: totalCost, calls: totalCalls, bySource }, calls: await journal.recent({ sessionId, day, limit }) })
+          return
+        }
+
+        // 本对话累计费用：跨所有日期聚合 day.sessions[sessionId]，含来源分组。
+        if (path === '/session' && req.method === 'GET') {
+          const url = new URL(req.url ?? '/api/dsh-cost/session', 'http://localhost')
+          const sessionId = url.searchParams.get('session') ?? ''
+          if (!sessionId) { send(400, { error: 'missing session' }); return }
+          const snap = await ledgerSnapshotFresh()
+          const total = { ...zeroBuckets(), calls: 0, cost: 0, bySource: {} }
+          for (const key of Object.keys(snap.days)) {
+            const entry = snap.days[key].sessions?.[sessionId]
+            if (!entry) continue
+            for (const bucketKey of Object.keys(zeroBuckets())) total[bucketKey] += entry[bucketKey] ?? 0
+            total.calls += entry.calls ?? 0
+            total.cost += entry.cost ?? 0
+            for (const [src, sub] of Object.entries(entry.bySource ?? {})) {
+              const target = total.bySource[src] ?? (total.bySource[src] = { cost: 0, calls: 0 })
+              target.cost += sub.cost ?? 0
+              target.calls += sub.calls ?? 0
+            }
+          }
+          send(200, {
+            session: sessionId,
+            total,
+            calls: ledger.recentCalls(100).filter((call) => call.session === sessionId),
+          })
           return
         }
 

@@ -704,7 +704,7 @@ body[data-ds-dark-theme] .dsh-cost-pop {
       const head = document.createElement('div')
       head.className = 'dsh-cost-pop-head'
       const title = document.createElement('span')
-      title.textContent = '费用明细'
+      title.textContent = '本对话费用'
       const sum = document.createElement('span')
       sum.textContent = moneyOf(state, data.total?.cost ?? 0)
       head.append(title, sum)
@@ -759,12 +759,12 @@ body[data-ds-dark-theme] .dsh-cost-pop {
       return box
     }
 
-    async function openOverviewPop(anchor) {
+    /** 弹卡只负责定位与渲染；数据由 pill 从 /session 拉好传进来。 */
+    function openOverviewPop(anchor, data) {
       closeOverviewPop()
       if (!anchor) return
       const pop = document.createElement('div')
       pop.className = 'dsh-cost-pop'
-      pop.textContent = '加载中…'
       document.body.appendChild(pop)
       overviewPop = pop
       const rect = anchor.getBoundingClientRect()
@@ -772,28 +772,35 @@ body[data-ds-dark-theme] .dsh-cost-pop {
       pop.style.top = rect.top - 8 + 'px'
       pop.style.transform = 'translateY(-100%)'
       document.addEventListener('click', closeOverviewPop, true)
-      try {
-        const res = await fetch(ENDPOINT + '/calls?limit=30', { cache: 'no-store' })
-        const data = res.ok ? await res.json() : null
-        if (!overviewPop) return
-        pop.textContent = ''
-        pop.appendChild(data ? renderOverview(data) : document.createTextNode('读取失败'))
-      } catch {
-        if (overviewPop) pop.textContent = '读取失败'
-      }
+      pop.appendChild(data ? renderOverview(data) : document.createTextNode('读取失败'))
     }
 
-    /** 状态行 pill：和 token / 缓存命中同排，点开看累计费用与每笔调用。 */
+    /** 状态行 pill：显示「本对话」累计费用，点开看分组与每笔调用。 */
     function CostPill() {
-      useCostState()
+      // useCostState 只用来在轮询到新账本时触发重渲染，值本身不用。
+      const tick = useCostState()
       const anchorRef = React.useRef(null)
       const [open, setOpen] = React.useState(false)
+      const [session, setSession] = React.useState(null)
+
       React.useEffect(() => {
         // 弹卡被点外部关掉时，把按钮的展开态同步回来。
         const timer = window.setInterval(() => { setOpen(Boolean(overviewPop)) }, 200)
         return () => window.clearInterval(timer)
       }, [])
+
+      React.useEffect(() => {
+        if (!currentSessionId) { setSession(null); return undefined }
+        let alive = true
+        fetch(ENDPOINT + '/session?session=' + encodeURIComponent(currentSessionId), { cache: 'no-store' })
+          .then((res) => (res.ok ? res.json() : null))
+          .then((value) => { if (alive) setSession(value) })
+          .catch(() => { /* 服务端未就绪：保持上一次的值 */ })
+        return () => { alive = false }
+      }, [tick, currentSessionId])
+
       const state = latestState
+      const amount = session ? moneyOf(state, session.total?.cost ?? 0) : '—'
       // 不用图标：宿主的 dock 对 svg 没有约束，一旦样式没跟上就撑成方块。
       // 关键排版用内联兜底，不依赖外部 CSS 是否已注入。
       return h('span', {
@@ -831,9 +838,9 @@ body[data-ds-dark-theme] .dsh-cost-pop {
         onClick: () => {
           if (overviewPop) { closeOverviewPop(); setOpen(false); return }
           setOpen(true)
-          void openOverviewPop(anchorRef.current)
+          openOverviewPop(anchorRef.current, session)
         },
-      }, state ? moneyOf(state, state.total?.cost ?? 0) : '—'))
+      }, amount))
     }
 
     function CostSection() {
