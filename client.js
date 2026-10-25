@@ -99,6 +99,40 @@ window.__ModuleLoader__.load({
 .dsh-cost-alert button:hover { color: var(--dsw-alias-label-primary); }
 .dsh-cost-badge.action { cursor: pointer; user-select: none; border: none; }
 .dsh-cost-badge.action:hover { color: var(--dsw-alias-label-primary); background: var(--dsw-alias-interactive-bg-hover); }
+/* 动作行费用按钮：仿官方「用量」按钮规格（12px tertiary、hover 淡底）。 */
+.dsh-cost-usage-anchor {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary, rgba(232, 238, 250, 0.55));
+  font-size: 12px;
+  line-height: 20px;
+  font-variant-numeric: tabular-nums;
+  padding: 0 4px;
+  border-radius: 4px;
+  cursor: default;
+  user-select: none;
+}
+.dsh-cost-usage-anchor:hover { color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-interactive-bg-hover); }
+/* 官方弹卡基准（0.6.1 提取的 ContextMeter 编译 CSS 令牌）。 */
+.dsh-cost-pop {
+  position: fixed;
+  z-index: 2147483647;
+  min-width: 240px;
+  max-width: min(300px, 100vw - 24px);
+  padding: 12px;
+  border-radius: var(--dsw-radius-lg, 12px);
+  background: var(--dsw-specific-menu, var(--dsw-alias-bg-layer-2, #1d232e));
+  box-shadow: var(--dsw-elevation-prominent, 0 8px 28px rgba(0, 0, 0, 0.28));
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 20px;
+}
+.dsh-cost-pop-head { display: flex; justify-content: space-between; gap: 12px; padding-bottom: 6px; margin-bottom: 4px; border-bottom: 1px solid var(--dsw-alias-border-l3, transparent); font-weight: 500; }
+.dsh-cost-pop-row { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
+.dsh-cost-pop-num { flex: none; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
 .dsh-cost-section { display: flex; flex-direction: column; gap: 16px; padding: 4px 2px 24px; font-size: 13px; color: var(--dsw-alias-label-primary); }
 .dsh-cost-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 @media (max-width: 1023px) { .dsh-cost-cards { grid-template-columns: 1fr; } }
@@ -359,7 +393,8 @@ window.__ModuleLoader__.load({
         return () => { active = false }
       }, [sessionId, start, end])
       if (start == null || end == null) return null
-      return h('details', { className: 'dsh-cost-turn' },
+      // 回合边界写到 DOM：动作行费用按钮从同回合的 details 读回窗口。
+      return h('details', { className: 'dsh-cost-turn', 'data-turn-from': String(start), 'data-turn-to': String(end) },
         h('summary', null,
           '本轮费用',
           value ? (value.found ? ` ≈ ${moneyOf(state, value.cost)}` : '') : ''),
@@ -398,6 +433,135 @@ window.__ModuleLoader__.load({
       return createPortal(h('div', { className: 'dsh-cost-alert' },
         h('span', null, message),
         h('button', { type: 'button', onClick: () => setVisible(false) }, '知道了')), document.body)
+    }
+
+    /* -- 动作行费用按钮：锚定在官方「用量」按钮旁，弹卡同官方样式 ------- */
+
+    const usageAnchors = { observer: null, scanning: false, pop: null }
+
+    /** 从「用量」按钮向上找同回合的 turnTail details（限深，宁缺毋错）。 */
+    function findTurnDetails(usageButton) {
+      let level = usageButton.parentElement
+      for (let depth = 0; depth < 6 && level; depth += 1) {
+        const details = level.querySelector?.('.dsh-cost-turn[data-turn-from]')
+        if (details) return details
+        level = level.parentElement
+      }
+      return null
+    }
+
+    function closeTurnCostPop() {
+      usageAnchors.pop?.remove()
+      usageAnchors.pop = null
+      document.removeEventListener('click', closeTurnCostPop, true)
+    }
+
+    function openTurnCostPop(anchor) {
+      closeTurnCostPop()
+      const from = anchor.dataset.turnFrom
+      const to = anchor.dataset.turnTo
+      if (!from || !to) return
+      const pop = document.createElement('div')
+      pop.className = 'dsh-cost-pop'
+      pop.textContent = '加载中…'
+      document.body.appendChild(pop)
+      usageAnchors.pop = pop
+      // 动作行贴近窗口底部：按官方弹卡惯例向上展开（compaction-control 教训）。
+      const rect = anchor.getBoundingClientRect()
+      pop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 280))}px`
+      pop.style.top = `${rect.top - 8}px`
+      pop.style.transform = 'translateY(-100%)'
+      document.addEventListener('click', closeTurnCostPop, true)
+      fetch(`${ENDPOINT}/turn?session=${encodeURIComponent(currentSessionId)}&from=${from}&to=${to}`, { cache: 'no-store' })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((value) => {
+          if (!usageAnchors.pop || !value) return
+          while (pop.firstChild) pop.removeChild(pop.firstChild)
+          const head = document.createElement('div')
+          head.className = 'dsh-cost-pop-head'
+          const title = document.createElement('span')
+          title.textContent = '本轮费用'
+          const total = document.createElement('span')
+          total.className = 'dsh-cost-pop-num'
+          total.textContent = value.found ? moneyOf(latestState, value.cost) : '—'
+          head.appendChild(title)
+          head.appendChild(total)
+          pop.appendChild(head)
+          for (const row of value.rows ?? []) {
+            const line = document.createElement('div')
+            line.className = 'dsh-cost-pop-row'
+            const label = document.createElement('span')
+            label.textContent = `${String(row.model ?? '').replace(/^deepseek-/, '')} · ${TURN_BUCKET_NAMES[row.bucket] ?? row.bucket}`
+            const numEl = document.createElement('span')
+            numEl.className = 'dsh-cost-pop-num'
+            numEl.textContent = `${Number(row.tokens).toLocaleString()} tok · ${moneyOf(latestState, row.cost)}`
+            line.appendChild(label)
+            line.appendChild(numEl)
+            pop.appendChild(line)
+          }
+          if (!value.found) {
+            const empty = document.createElement('div')
+            empty.className = 'dsh-cost-pop-row'
+            empty.textContent = '该回合暂无用量记录'
+            pop.appendChild(empty)
+          }
+        })
+        .catch(() => closeTurnCostPop())
+    }
+
+    /** 扫描官方「用量 X tok」按钮，在其前插入同款费用按钮（每按钮只插一次）。 */
+    function mountUsageAnchors() {
+      const buttons = document.querySelectorAll('button')
+      for (const button of buttons) {
+        if (button.offsetParent === null) continue
+        if (button.previousElementSibling?.classList.contains('dsh-cost-usage-anchor')) continue
+        const text = (button.textContent ?? '').trim()
+        if (!text.startsWith('用量') || !text.includes('tok')) continue
+        const details = findTurnDetails(button)
+        if (!details) continue
+        const anchor = document.createElement('button')
+        anchor.className = 'dsh-cost-usage-anchor'
+        anchor.type = 'button'
+        anchor.textContent = '费用 —'
+        const from = details.getAttribute('data-turn-from') ?? ''
+        const to = details.getAttribute('data-turn-to') ?? ''
+        anchor.dataset.turnFrom = from
+        anchor.dataset.turnTo = to
+        anchor.addEventListener('click', (event) => {
+          event.stopPropagation()
+          openTurnCostPop(anchor)
+        })
+        button.insertAdjacentElement('beforebegin', anchor)
+        // 金额异步补：同回合 /turn 已被 turnTail 查过，这里独立补一次。
+        fetch(`${ENDPOINT}/turn?session=${encodeURIComponent(currentSessionId)}&from=${from}&to=${to}`, { cache: 'no-store' })
+          .then((res) => (res.ok ? res.json() : null))
+          .then((value) => {
+            if (value?.found && anchor.isConnected) {
+              anchor.textContent = `费用 ${moneyOf(latestState, value.cost)}`
+              anchor.title = '本轮费用明细'
+            } else if (anchor.isConnected) {
+              anchor.textContent = '费用 —'
+            }
+          })
+          .catch(() => {})
+      }
+    }
+
+    function startUsageAnchors() {
+      let timer = 0
+      const scan = () => {
+        timer = 0
+        usageAnchors.scanning = false
+        try { mountUsageAnchors() } catch { /* 扫描失败下轮再试 */ }
+      }
+      const scheduleScan = () => {
+        if (usageAnchors.scanning || timer) return
+        usageAnchors.scanning = true
+        timer = setTimeout(scan, 400)
+      }
+      scheduleScan()
+      usageAnchors.observer = new MutationObserver(scheduleScan)
+      usageAnchors.observer.observe(document.body, { childList: true, subtree: true })
     }
 
     /* -- 界面四：设置页「费用」分节 ------------------------------------ */
@@ -504,8 +668,9 @@ window.__ModuleLoader__.load({
         ensureStyle()
         startPoller()
         startSessionAnchor()
+        startUsageAnchors()
         sessionWatchers.add(renderSessionAnchor)
-        console.info('[dsh-cost] client 0.3.0 active')
+        console.info('[dsh-cost] client 0.6.0 active')
         // 只当 sessionId 感知器（渲染 null），费用本体锚定在宿主状态行末尾。
         ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
           name: 'conversation.input.dock',

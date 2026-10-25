@@ -2,6 +2,22 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0] - 2026-10-25
+
+### 新增：官方「用量」按钮旁的回合费用按钮 + 明细弹卡
+
+官方的「用量 6.8M tok」按钮（回复动作行，token-meter 的
+deriveTurnTokenUsage）只显示 token 不显示钱——在它旁边加同款「费用 ¥x」：
+
+- **锚定**：扫描动作行里官方「用量」按钮（文本以「用量」开头且含 tok、
+  可见），在它前面插兄弟位置的费用按钮（React 不管兄弟， MutationObserver
+  400ms 节流重锚）；回合边界从同回合的 turnTail details（data-turn-from/to）
+  读回——向上爬限深 6 级，找不到就显示「费用 —」，宁缺毋错。
+- **弹卡**：点击按官方弹卡基准（--dsw-specific-menu 底、--dsw-radius-lg、
+  --dsw-elevation-prominent、向上展开防窗口底部裁剪）渲染本轮费用 + 分桶
+  明细（模型 · 桶 · tokens · 金额），数据走 /turn 端点；点击外部关闭。
+- 按钮样式仿官方动作行规格（12px tertiary、hover 淡底、tabular-nums）。
+
 ## [0.5.0] - 2026-10-25
 
 ### 历史回填 + 峰谷提醒 + 导出（cost-meter 批量搬运第二批）
