@@ -4,6 +4,8 @@ dsh（DeepSeek Harness）会话费用统计插件：每次模型调用按 DeepSe
 
 架构借鉴 [Han-1413141/dsh-cost-meter](https://github.com/Han-1413141/dsh-cost-meter)（v1.9.39）：`ctx.on('llm/stream', …, { global: true })` 瀑布监听为唯一计量通道，逐 chunk 透传不改流协议；金额恒以美元存储、展示层换币；峰谷规则、历史档位与计费数学与其 lib/pricing.js 同口径。
 
+![费用弹卡](docs/popover.png)
+
 ## 功能
 
 - **实时计量**：llm/stream 链尾旁路捕获 usage 五桶（输入 / 输出 / 缓存读 / 缓存写 / 推理），按官方价格计费；ALS 深度标记 + (model, 五桶指纹) 10s 窗去重双重防包装路由重复入账。

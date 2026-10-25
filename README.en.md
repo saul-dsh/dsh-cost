@@ -4,6 +4,8 @@ Session cost tracking plugin for the DeepSeek Harness (dsh): every model call is
 
 Architecture borrows from [Han-1413141/dsh-cost-meter](https://github.com/Han-1413141/dsh-cost-meter) (v1.9.39): the `ctx.on('llm/stream', …, { global: true })` waterfall listener is the sole metering channel, passing chunks through untouched; amounts are always stored in USD with display-layer conversion; peak/off-peak rules, historical tiers and billing math follow its lib/pricing.js.
 
+![Cost popover](docs/popover.png)
+
 ## Features
 
 - **Real-time metering**: tail listener on the llm/stream waterfall captures the five usage buckets (input / output / cache-read / cache-write / reasoning); an ALS depth marker plus (model, five-bucket fingerprint) 10s-window dedup double-guard against wrapper-router double billing.
