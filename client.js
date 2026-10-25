@@ -99,14 +99,16 @@ window.__ModuleLoader__.load({
 .dsh-cost-alert button:hover { color: var(--dsw-alias-label-primary); }
 .dsh-cost-badge.action { cursor: pointer; user-select: none; border: none; }
 .dsh-cost-badge.action:hover { color: var(--dsw-alias-label-primary); background: var(--dsw-alias-interactive-bg-hover); }
-/* 动作行费用按钮：仿官方「用量」按钮规格（12px tertiary、hover 淡底）。 */
+/* 动作行费用按钮：对齐官方「用量」按钮（tertiary 纯文字、无底色；
+   !important 用于压过宿主动作行对 button 元素的默认底色/文字色）。 */
 .dsh-cost-usage-anchor {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  border: none;
-  background: transparent;
-  color: var(--dsw-alias-label-tertiary, rgba(232, 238, 250, 0.55));
+  border: none !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  color: var(--dsw-alias-label-tertiary, rgba(232, 238, 250, 0.55)) !important;
   font-size: 12px;
   line-height: 20px;
   font-variant-numeric: tabular-nums;
@@ -115,7 +117,10 @@ window.__ModuleLoader__.load({
   cursor: default;
   user-select: none;
 }
-.dsh-cost-usage-anchor:hover { color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-interactive-bg-hover); }
+.dsh-cost-usage-anchor:hover {
+  color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72)) !important;
+  background: var(--dsw-alias-interactive-bg-hover) !important;
+}
 /* 官方弹卡基准（0.6.1 提取的 ContextMeter 编译 CSS 令牌）。 */
 .dsh-cost-pop {
   position: fixed;
