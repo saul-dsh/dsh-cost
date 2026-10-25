@@ -1,0 +1,53 @@
+{
+  "name": "dsh-cost",
+  "version": "0.1.0",
+  "description": "Session cost tracking for the DeepSeek Harness (dsh): per-call token usage billed at official DeepSeek rates (peak/off-peak aware), per-day/per-model/per-session ledger, today/month/total cards, session cost chip and settings page. Bilingual-ready UI.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "cost",
+    "usage",
+    "billing",
+    "cordis"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saul-dsh/dsh-cost.git"
+  },
+  "homepage": "https://github.com/saul-dsh/dsh-cost#readme",
+  "bugs": {
+    "url": "https://github.com/saul-dsh/dsh-cost/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}
