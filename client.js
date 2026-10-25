@@ -143,11 +143,12 @@ window.__ModuleLoader__.load({
   cursor: pointer;
   transition: background 120ms ease, color 120ms ease;
 }
-/* 内联写了 background: transparent 兜底，hover 必须 !important 才盖得住 */
+/* 内联写了 background/color 兜底，hover 必须 !important 才盖得住。
+   值同 dsh：--dsw-alias-interactive-bg-hover / --dsw-alias-label-secondary。 */
 .dsh-cost-pill:hover,
 .dsh-cost-pill[aria-expanded="true"] {
-  background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.08)) !important;
-  color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72));
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: rgb(207, 211, 214) !important;
 }
 .dsh-cost-pill svg { width: 14px; height: 14px; flex: none; }
 
@@ -805,6 +806,10 @@ body[data-ds-dark-theme] .dsh-cost-pop {
         className: 'dsh-cost-pill',
         'aria-expanded': open ? 'true' : 'false',
         title: '费用明细',
+        // 数值全部来自 dsh 的状态行规范：font-size 12px / line-height 20px /
+        // 文字色 --dsw-alias-label-tertiary(暗色 rgb(173,178,184)) /
+        // padding 1px 8px / 圆角 --dsw-radius-sm(8px)。不用 inherit，宿主那层
+        // 拿到的字号和色号都不是 pill 该用的。
         style: {
           display: 'inline-flex',
           flexDirection: 'row',
@@ -816,10 +821,10 @@ body[data-ds-dark-theme] .dsh-cost-pop {
           border: 'none',
           borderRadius: '8px',
           background: 'transparent',
-          color: 'inherit',
-          font: 'inherit',
-          fontVariantNumeric: 'tabular-nums',
+          color: 'rgb(173, 178, 184)',
+          fontSize: '12px',
           lineHeight: '20px',
+          fontVariantNumeric: 'tabular-nums',
           whiteSpace: 'nowrap',
           cursor: 'pointer',
         },
