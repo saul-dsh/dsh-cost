@@ -117,17 +117,23 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72)) !important;
   background: var(--dsw-alias-interactive-bg-hover) !important;
 }
-/* 官方弹卡基准（0.6.1 提取的 ContextMeter 编译 CSS 令牌）。 */
+/* 官方弹卡基准（0.6.2 按 official-popover.template.css 从已装 asar 提取的
+   完整规则重写——底色是半透明的，必须带 backdrop-filter 毛玻璃才不穿帮）。 */
 .dsh-cost-pop {
   position: fixed;
-  z-index: 2147483647;
-  min-width: 240px;
-  max-width: min(300px, 100vw - 24px);
-  padding: 12px;
+  z-index: 1100;
+  box-sizing: border-box;
+  border: 0;
   border-radius: var(--dsw-radius-lg, 12px);
-  background: var(--dsw-specific-menu, var(--dsw-alias-bg-layer-2, #1d232e));
-  box-shadow: var(--dsw-elevation-prominent, 0 8px 28px rgba(0, 0, 0, 0.28));
-  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-specific-menu, rgba(67, 69, 74, 0.45));
+  backdrop-filter: var(--dsw-menu-backdrop-filter, blur(40px) saturate(150%));
+  -webkit-backdrop-filter: var(--dsw-menu-backdrop-filter, blur(40px) saturate(150%));
+  width: min(300px, 100vw - 24px);
+  --dsw-elevation-stroke-color: var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.08));
+  box-shadow: var(--dsw-elevation-prominent, 0 0 0 0.5px var(--dsw-elevation-stroke-color), 0 3px 8px 0 rgba(0, 0, 0, 0.04), 0 0 20px 0 rgba(0, 0, 0, 0.05));
+  color: var(--dsw-alias-label-secondary);
+  cursor: default;
+  padding: 12px;
   font-size: 12px;
   line-height: 20px;
 }

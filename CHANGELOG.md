@@ -2,6 +2,22 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.2] - 2026-10-25
+
+### 修复：费用弹卡透明穿帮（反代官方完整弹卡样式）
+
+弹卡此前只抄了 `--dsw-specific-menu` 底色——官方菜单底是**半透明色**
+（暗色 #43454a73），必须搭配 `--dsw-menu-backdrop-filter: blur(40px)
+saturate(150%)` 的毛玻璃才是官方观感，缺了就整个透出下层文字。
+
+- 从已装 app.asar 提取官方弹卡（ContextMeter `A6Bq1a_panel` / 统计
+  `xXe6ja_panel`）的完整编译规则，整理为
+  **`packages/dsh-cost/official-popover.template.css`** 模板（token 字面
+  值 + 组件组装规则 + 使用注意），后续一切弹卡 UI 以它为准。
+- `.dsh-cost-pop` 改用官方规则原样：specific-menu 底 + menu-backdrop-
+  filter 毛玻璃 + radius-lg + elevation-prominent（stroke l1）+
+  label-secondary 文字，宽度 min(300px, 100vw-24px)。
+
 ## [0.6.1] - 2026-10-25
 
 ### 移除：回合尾部的可见费用行

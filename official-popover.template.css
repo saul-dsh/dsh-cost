@@ -1,0 +1,82 @@
+/* ====================================================================
+   dsh 官方弹卡（menu / popover）样式模板
+   --------------------------------------------------------------------
+   来源：从已安装的 DeepSeek Harness app.asar 提取的编译产物
+   （packages/client/ui-* 的 *.module.css，类名 A6Bq1a_panel /
+   xXe6ja_panel，2026-10-25 提取）。
+   --------------------------------------------------------------------
+   关键认知（0.6.2 透明穿帮教训）：
+   官方弹卡底色 --dsw-specific-menu 是**半透明色**（暗色 #43454a73 ≈ 45%
+   透明度），必须搭配 backdrop-filter 的毛玻璃（blur 40px + 饱和 150%）
+   才是官方观感；只抄底色不抄 backdrop-filter 会直接透明穿帮。
+   宿主运行时已全局定义这些令牌——组件里直接 var() 引用即可，下面的
+   字面值仅作离线备份/非 dsh 环境使用。
+   ==================================================================== */
+
+/* —— 令牌（亮色 :root / 暗色 body[data-ds-dark-theme]） —— */
+:root {
+  --dsw-menu-surface-fill: #f8f9fa94;
+  --dsw-specific-menu: var(--dsw-menu-surface-fill);
+  --dsw-menu-backdrop-filter: blur(40px) saturate(150%);
+}
+body[data-ds-dark-theme] {
+  --dsw-menu-surface-fill: #43454a73;
+  --dsw-alias-menu-group-header-fill: #303136f0;
+}
+
+/* —— elevation 组合（宿主 body 全局已有；弹卡局部覆写描边色为 l1） ——
+   --dsw-elevation-stroke:    0 0 0 .5px var(--dsw-elevation-stroke-color)
+   --dsw-elevation-prominent: stroke, 0 3px 8px 0 #0000000a, 0 0 20px 0 #0000000d
+   官方弹卡写法：容器内声明 --dsw-elevation-stroke-color 后引用 prominent。 */
+
+/* —— 标准弹卡容器（A6Bq1a_panel：ContextMeter / 小型菜单，264px） —— */
+.official-popover {
+  position: fixed;
+  z-index: 1100;
+  box-sizing: border-box;
+  border: 0;
+  border-radius: var(--dsw-radius-lg);
+  background: var(--dsw-specific-menu);
+  backdrop-filter: var(--dsw-menu-backdrop-filter);
+  width: min(264px, 100vw - 24px);
+  --dsw-elevation-stroke-color: var(--dsw-alias-border-l1);
+  box-shadow: var(--dsw-elevation-prominent);
+  color: var(--dsw-alias-label-secondary);
+  cursor: default;
+  padding: 12px;
+  font-size: 12px;
+  line-height: 20px;
+}
+
+/* —— 宽体变体（xXe6ja_panel：统计弹窗面板，300–440px / padding 16 / 行高 18） —— */
+.official-popover.wide {
+  width: max-content;
+  min-width: min(300px, 100vw - 24px);
+  max-width: min(440px, 100vw - 24px);
+  padding: 16px;
+  line-height: 18px;
+}
+
+/* —— 头部行（A6Bq1a_header：flex + 6px 间距，标题 label-primary） —— */
+.official-popover .header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.official-popover .header .title {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* —— 数据行（label 左 / 数值右，数值 tabular-nums + primary） —— */
+.official-popover .row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 0;
+  color: var(--dsw-alias-label-secondary);
+}
+.official-popover .row .num {
+  flex: none;
+  color: var(--dsw-alias-label-primary);
+  font-variant-numeric: tabular-nums;
+}
