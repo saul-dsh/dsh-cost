@@ -444,7 +444,7 @@ body[data-ds-dark-theme] .dsh-cost-pop {
 
     /* -- 动作行费用按钮：锚定在官方「用量」按钮旁，弹卡同官方样式 ------- */
 
-    const usageAnchors = { observer: null, scanning: false, pop: null }
+    const usageAnchors = { observer: null, scanning: false, pop: null, anchor: null }
 
     /** 从「用量」按钮向上找同回合的隐形边界载体（限深，宁缺毋错）。 */
     function findTurnDetails(usageButton) {
@@ -457,9 +457,17 @@ body[data-ds-dark-theme] .dsh-cost-pop {
       return null
     }
 
-    function closeTurnCostPop() {
+    function closeTurnCostPop(event) {
+      // 点在费用按钮上不在这里关：capture 阶段比按钮自己的 click 先跑，
+      // 这里关了按钮又会重新打开，永远关不掉。toggle 交给按钮自己做。
+      if (event?.target instanceof Node) {
+        if (event.target.closest?.('.dsh-cost-usage-anchor')) return
+        // 点弹卡内部（文字、数字）也不该收起，只有点外面才关。
+        if (usageAnchors.pop?.contains(event.target)) return
+      }
       usageAnchors.pop?.remove()
       usageAnchors.pop = null
+      usageAnchors.anchor = null
       document.removeEventListener('click', closeTurnCostPop, true)
     }
 
@@ -473,6 +481,7 @@ body[data-ds-dark-theme] .dsh-cost-pop {
       pop.textContent = '加载中…'
       document.body.appendChild(pop)
       usageAnchors.pop = pop
+      usageAnchors.anchor = anchor
       // 动作行贴近窗口底部：按官方弹卡惯例向上展开（compaction-control 教训）。
       const rect = anchor.getBoundingClientRect()
       pop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 280))}px`
@@ -538,6 +547,11 @@ body[data-ds-dark-theme] .dsh-cost-pop {
         anchor.dataset.turnTo = to
         anchor.addEventListener('click', (event) => {
           event.stopPropagation()
+          // 再点同一个按钮 = 收起；点另一个回合的按钮 = 切过去。
+          if (usageAnchors.pop && usageAnchors.anchor === anchor) {
+            closeTurnCostPop()
+            return
+          }
           openTurnCostPop(anchor)
         })
         // 插到「用量」按钮右侧（用户指定：用量在左、费用在右）。
