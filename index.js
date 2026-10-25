@@ -29,7 +29,7 @@
 
 import Schema from '@deepseek-ai/schemastery'
 import { appendFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -210,11 +210,39 @@ function createJournal() {
       return rows.slice(0, Math.min(200, Math.max(1, limit)))
     },
     /**
+     * 增量读取：从字节偏移起新增的完整行（字节级，避免多字节字符错位；
+     * 轮转后新文件比偏移小 → 从头读新卷，天然不会重放旧卷）。
+     * 供锁持有者把 journal 折叠进 ledger（跨进程单写者模型）。
+     */
+    async recordsAfter(offset = 0) {
+      try {
+        const info = await stat(JOURNAL_PATH)
+        if (info.size === offset) return { rows: [], offset }
+        if (info.size < offset) offset = 0
+        const buf = await readFile(JOURNAL_PATH)
+        let start = offset
+        if (offset > 0) {
+          // 偏移已在行边界（前一字节是换行）则直接用；落在行中间才跳到下一行。
+          if (buf[offset - 1] !== 10) {
+            const nl = buf.indexOf(10, offset)
+            if (nl < 0) return { rows: [], offset: buf.length }
+            start = nl + 1
+          }
+        }
+        const rows = []
+        for (const line of buf.slice(start).toString('utf8').split('\n')) {
+          if (!line) continue
+          try { rows.push(JSON.parse(line)) } catch { /* 半行跳过 */ }
+        }
+        return { rows, offset: buf.length }
+      } catch { return { rows: [], offset } }
+    },
+
+    /**
      * 回合费用：会话在 [from,to] 时间窗内的调用聚合（客户端 turnTail 槽位
      * 传宿主 turn/start~turn/end 事件时间）。journal 只保当前卷——轮转掉的
      * 旧回合查不到，金额对 UI 恒标「≈」估算口径。
-     */
-    async range({ sessionId = '', from = 0, to = Number.MAX_SAFE_INTEGER } = {}) {
+     */    async range({ sessionId = '', from = 0, to = Number.MAX_SAFE_INTEGER } = {}) {
       let text = ''
       try { text = await readFile(JOURNAL_PATH, 'utf8') } catch { return { found: false, cost: 0, rows: [], calls: [] } }
       const calls = []
@@ -318,6 +346,13 @@ function createLedger(retentionDays) {
       }
       scheduleFlush()
       return true
+    },
+    /** journal 折叠进度（字节偏移，随 ledger 一起落盘 → 崩溃安全，不重不漏）。 */
+    journalOffset() { return state.journalOffset ?? 0 },
+    setJournalOffset(offset) {
+      if (!Number.isFinite(offset) || offset <= (state.journalOffset ?? 0)) return
+      state.journalOffset = offset
+      scheduleFlush()
     },
     /** 累加一次模型调用的用量与费用。 */
     account({ sessionId, model, buckets, cost, atMs }) {
@@ -445,10 +480,11 @@ function samplesFromEvents(events, cursorAtMs) {
 }
 
 /**
- * 扫描全部会话日志回填历史（boot 后延迟触发；游标幂等，可重复执行）。
- * 回填只进聚合账本，不写 journal（回合明细只覆盖实时期）。
+ * 扫描全部会话日志回填历史（仅锁持有者，boot 后延迟触发；游标幂等）。
+ * 0.7.0 起回填样本写 journal（与实时计量同源），由 ingest 统一折叠——
+ * 回填与实时对同一调用的重叠由 ingest 的指纹去重互斥，永不双计。
  */
-async function runBackfill(ledger, priceEntryFor) {
+async function runBackfill(journal, ledger, priceEntryFor) {
   const workspaces = await readdir(SESSIONS_ROOT, { withFileTypes: true }).catch(() => [])
   let touchedSessions = 0
   let importedCalls = 0
@@ -468,18 +504,31 @@ async function runBackfill(ledger, priceEntryFor) {
           if (!line) continue
           try { events.push(JSON.parse(line)) } catch { /* 半行跳过 */ }
         }
-        const sessionKey = `${workspace.name}/${sessionDir.name}`
-        const { sessionId, samples } = samplesFromEvents(events, ledger.importedAt(sessionKey))
+        const probe = samplesFromEvents(events, 0)
+        const sessionId = probe.sessionId
+        const { samples } = samplesFromEvents(events, sessionId ? ledger.importedAt(sessionId) : 0)
         let maxAt = 0
         for (const sample of samples) {
           const entry = priceEntryFor(sample.model)
           if (!entry) continue
-          const cost = costOfBuckets(sample.buckets, tierFor(entry, sample.atMs, isPeakAt(sample.atMs)))
-          ledger.account({ sessionId, model: sample.model, buckets: sample.buckets, cost, atMs: sample.atMs })
+          const peak = isPeakAt(sample.atMs)
+          const tier = tierFor(entry, sample.atMs, peak)
+          const cost = costOfBuckets(sample.buckets, tier)
+          await journal.write({
+            at: sample.atMs,
+            day: localDayKey(sample.atMs),
+            session: sessionId || '',
+            model: sample.model,
+            provider: sample.provider,
+            ...sample.buckets,
+            rows: bucketRows(sample.buckets, tier),
+            cost,
+            peak,
+          })
           maxAt = Math.max(maxAt, sample.atMs)
           importedCalls += 1
         }
-        if (maxAt > 0 && ledger.markImported(sessionKey, maxAt)) touchedSessions += 1
+        if (sessionId && maxAt > 0 && ledger.markImported(sessionId, maxAt)) touchedSessions += 1
         // 让出事件循环：几百个会话的解压不能卡住宿主启动。
         await new Promise((resolve) => setImmediate(resolve))
       } catch (error) {
@@ -487,7 +536,7 @@ async function runBackfill(ledger, priceEntryFor) {
       }
     }
   }
-  if (importedCalls > 0) void report(`backfill done: +${importedCalls} calls across ${touchedSessions} sessions`)
+  if (importedCalls > 0) void report(`backfill appended ${importedCalls} journal rows across ${touchedSessions} sessions`)
   else void report('backfill done: nothing new')
 }
 
@@ -502,9 +551,53 @@ function nextPeakSwitch(now) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 插件入口                                                             */
+/* 跨进程单写者锁（双进程同 boot 实锤；非持有者只 append journal）        */
 /* ------------------------------------------------------------------ */
 
+const LOCK_STALE_MS = 30_000
+
+function acquireLedgerLock(path) {
+  const tryWrite = () => {
+    try {
+      const fd = openSync(path, 'wx')
+      writeSync(fd, String(process.pid))
+      closeSync(fd)
+      return true
+    } catch (error) {
+      if (error?.code === 'EEXIST') return false
+      throw error
+    }
+  }
+  if (tryWrite()) return { owner: true }
+  try {
+    const info = statSync(path)
+    const holder = Number(readFileSync(path, 'utf8'))
+    let alive = false
+    if (Number.isSafeInteger(holder) && holder > 0) {
+      try { process.kill(holder, 0); alive = true } catch (error) { alive = error?.code === 'EPERM' }
+    }
+    if (!alive || Date.now() - info.mtimeMs > LOCK_STALE_MS) {
+      // 持有者已死或心跳超时：抢占（万一并发抢占，后写者败走非持有者，无害）。
+      try { unlinkSync(path) } catch { /* ignore */ }
+      return { owner: tryWrite() }
+    }
+  } catch { return { owner: tryWrite() } }
+  return { owner: false }
+}
+
+function touchLedgerLock(path) {
+  try { utimesSync(path, new Date(), new Date()) } catch { /* ignore */ }
+}
+
+function releaseLedgerLock(path) {
+  try {
+    if (Number(readFileSync(path, 'utf8')) === process.pid) unlinkSync(path)
+  } catch { /* ignore */ }
+}
+
+/* ------------------------------------------------------------------ */
+/* 插件入口                                                             */
+/* ------------------------------------------------------------------ */
 export const inject = []
 
 export const Config = Schema.object({
@@ -527,18 +620,60 @@ export const Config = Schema.object({
 export function apply(ctx, config) {
   if (!config.enabled) return
 
-  void report(`server boot v0.5.0 pid=${process.pid} retention=${config.retentionDays} rate=${config.exchangeRate} budget=${config.budgetEnabled ? `${config.budgetAmount}/${config.budgetPeriod}` : 'off'} backfill=${config.backfillEnabled ? 'on' : 'off'}`)
+  const lockPath = join(STORE_DIR, 'ledger.lock')
+  const lock = acquireLedgerLock(lockPath)
+  void report(`server boot v0.7.0 pid=${process.pid} ledgerOwner=${lock.owner} retention=${config.retentionDays} rate=${config.exchangeRate} budget=${config.budgetEnabled ? `${config.budgetAmount}/${config.budgetPeriod}` : 'off'} backfill=${config.backfillEnabled && lock.owner ? 'on' : 'off'}`)
 
   const ledger = createLedger(config.retentionDays)
-  ledger.load()
-  ctx.effect(() => ledger.dispose(), 'dsh-cost: ledger flush')
+  if (lock.owner) ledger.load()
+  ctx.effect(() => { ledger.dispose(); if (lock.owner) releaseLedgerLock(lockPath) }, 'dsh-cost: ledger flush + lock release')
 
   const admitUsage = createUsageDeduper()
   const journal = createJournal()
 
-  // 历史回填：boot 后延迟 3s（避开宿主启动高峰），游标幂等可重复执行。
-  if (config.backfillEnabled) {
-    const backfillTimer = setTimeout(() => { void runBackfill(ledger, priceEntryFor).catch((error) => { void report(`backfill crashed: ${String(error?.message ?? error).slice(0, 200)}`) }) }, 3000)
+  /**
+   * 锁持有者把 journal 增量折叠进 ledger（0.7.0 单写者模型）：
+   * 两个进程都会 boot 并各听各的 llm/stream——都只 append journal（O_APPEND
+   * 单行跨进程安全）；只有锁持有者写 ledger.json，彻底消除整文件互踩。
+   * 指纹去重兜底：同一事件被两进程捕获 / 回填与实时重叠，10s 窗内互斥。
+   */
+  const ingestDedup = createUsageDeduper()
+  let ingestedCount = 0
+  let ingestBusy = false
+  async function ingestJournal() {
+    if (!lock.owner || ingestBusy) return
+    ingestBusy = true
+    try {
+      const { rows, offset } = await journal.recordsAfter(ledger.journalOffset())
+      for (const row of rows) {
+        if (!row || !Number.isFinite(row.at) || !Number.isFinite(row.cost) || !row.model) continue
+        const buckets = { input: row.input ?? 0, output: row.output ?? 0, cacheRead: row.cacheRead ?? 0, cacheWrite: row.cacheWrite ?? 0, reasoning: row.reasoning ?? 0 }
+        if (!ingestDedup(`${row.session ?? ''}|${row.model}`, buckets, row.at)) continue
+        ledger.account({ sessionId: row.session, model: row.model, buckets, cost: row.cost, atMs: row.at })
+        // +60s 余量：日志事件记的是消息完成时刻，晚于实时流发起时刻；
+        // 游标盖住整个调用时长，防回填重放同一条。
+        if (row.session) ledger.markImported(row.session, row.at + 60_000)
+        ingestedCount += 1
+      }
+      ledger.setJournalOffset(offset)
+      if (rows.length > 0) touchLedgerLock(lockPath)
+    } catch (error) {
+      void report(`ingest failed: ${String(error?.message ?? error).slice(0, 160)}`)
+    } finally {
+      ingestBusy = false
+    }
+  }
+
+  if (lock.owner) {
+    const ingestTimer = setInterval(() => { void ingestJournal() }, 5000)
+    ingestTimer.unref?.()
+    ctx.effect(() => () => clearInterval(ingestTimer), 'dsh-cost: journal ingest timer')
+  }
+
+  // 历史回填：仅锁持有者执行（boot 后 3s，避开宿主启动高峰）；0.7.0 起
+  // 改写 journal（与实时同源），由 ingest 统一折叠 + 指纹去重，天然不重。
+  if (config.backfillEnabled && lock.owner) {
+    const backfillTimer = setTimeout(() => { void runBackfill(journal, ledger, priceEntryFor).catch((error) => { void report(`backfill crashed: ${String(error?.message ?? error).slice(0, 200)}`) }) }, 3000)
     backfillTimer.unref?.()
     ctx.effect(() => () => clearTimeout(backfillTimer), 'dsh-cost: backfill timer')
   }
@@ -602,12 +737,13 @@ export function apply(ctx, config) {
             }
             const entry = priceEntryFor(model)
             if (entry) {
-              // 指纹去重兜底：ALS 逃逸的包装路由双份 usage 在此互斥（10s 窗）。
+              // 指纹去重兜底：本进程内 ALS 逃逸/同流双 usage 互斥（10s 窗）。
               if (admitUsage(model, buckets, startedAtMs)) {
                 const peak = isPeakAt(startedAtMs)
                 const tier = tierFor(entry, startedAtMs, peak)
                 const cost = costOfBuckets(buckets, tier)
-                ledger.account({ sessionId, model, buckets, cost, atMs: startedAtMs })
+                // 0.7.0 单写者模型：所有进程只 append journal（跨进程安全），
+                // ledger 由锁持有者的 ingest 统一折叠。
                 void journal.write({
                   at: startedAtMs,
                   day: localDayKey(startedAtMs),
@@ -622,7 +758,7 @@ export function apply(ctx, config) {
                 accountCount += 1
                 // 采样留痕（前 10 条全记，之后 1/20），足以判定通路与发现异常。
                 if (accountCount <= 10 || accountCount % 20 === 0) {
-                  void report(`accounted #${accountCount} pid=${process.pid} model=${model} provider=${provider} session=${sessionId ? sessionId.slice(0, 40) : '(none)'} peak=${peak ? 1 : 0} buckets=${JSON.stringify(buckets)} cost=$${cost.toFixed(6)}`)
+                  void report(`journaled #${accountCount} pid=${process.pid} owner=${lock.owner ? 1 : 0} model=${model} provider=${provider} session=${sessionId ? sessionId.slice(0, 40) : '(none)'} peak=${peak ? 1 : 0} buckets=${JSON.stringify(buckets)} cost=$${cost.toFixed(6)}`)
                 }
               } else {
                 void report(`dedup skip model=${model} buckets=${JSON.stringify(buckets)}`)
@@ -644,6 +780,15 @@ export function apply(ctx, config) {
   /* -- HTTP 端点 ------------------------------------------------------ */
 
   ctx.inject(['webServer'], (webCtx) => {
+    /** /state、/export 共用：锁持有者先折叠+落盘再读文件；非持有者直读
+     （持有者 5s ingest + 800ms 防抖，两个进程的 UI 数据都足够新鲜）。 */
+    async function ledgerSnapshotFresh() {
+      if (lock.owner) {
+        await ingestJournal()
+        ledger.flushSync()
+      }
+      try { return JSON.parse(await readFile(LEDGER_PATH, 'utf8')) } catch { return { days: {} } }
+    }
     webCtx.effect(() => webCtx.webServer.register({
       kind: 'prefix',
       path: '/api/dsh-cost',
@@ -656,7 +801,7 @@ export function apply(ctx, config) {
         const path = (req.url ?? '').split('?')[0].replace(/^\/api\/dsh-cost/, '')
 
         if (path === '/state' && req.method === 'GET') {
-          const snap = ledger.snapshot()
+          const snap = await ledgerSnapshotFresh()
           const now = Date.now()
           const todayKey = localDayKey(now)
           const monthPrefix = todayKey.slice(0, 7)
@@ -745,7 +890,7 @@ export function apply(ctx, config) {
         // 导出：全量 JSON（含日/模型/会话聚合）或日汇总 CSV。
         if (path === '/export' && req.method === 'GET') {
           const url = new URL(req.url ?? '/api/dsh-cost/export', 'http://localhost')
-          const snap = ledger.snapshot()
+          const snap = await ledgerSnapshotFresh()
           if ((url.searchParams.get('format') ?? 'json') === 'csv') {
             const lines = ['date,input,output,cache_read,cache_write,reasoning,calls,cost_usd']
             for (const key of Object.keys(snap.days).sort()) {
