@@ -23,44 +23,35 @@ window.__ModuleLoader__.load({
 
     /* 官方 token 配色（compaction-control / cost-meter 同基准），无自创色。 */
     const CSS = `
-.dsh-cost-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  height: 22px;
-  padding: 0 8px;
-  border: none;
-  border-radius: 6px;
-  background: var(--dsw-alias-bg-layer-2, transparent);
-  color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72));
-  font-size: 12px;
-  line-height: 22px;
+.dsh-cost-inline {
   font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72));
   white-space: nowrap;
-  cursor: default;
-  user-select: none;
 }
-.dsh-cost-chip:hover { background: var(--dsw-alias-interactive-bg-hover); }
-.dsh-cost-chip:focus-visible { box-shadow: 0 0 0 2px var(--dsw-alias-brand-primary); outline: none; }
-.dsh-cost-chip[data-live="1"] .dsh-cost-amount { color: var(--dsw-alias-label-primary); }
-.dsh-cost-today {
+.dsh-cost-sidebar {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 6px;
+  justify-content: space-between;
+  gap: 8px;
   width: 100%;
-  height: 28px;
+  margin-top: 8px;
+  padding: 7px 12px;
   border: none;
-  border-radius: 8px;
+  border-top: 1px solid var(--dsw-alias-border-l3, transparent);
   background: transparent;
   color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72));
   font-size: 12px;
   line-height: 20px;
-  font-variant-numeric: tabular-nums;
   cursor: default;
   user-select: none;
 }
-.dsh-cost-today:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.dsh-cost-sidebar:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.dsh-cost-sidebar:focus-visible { box-shadow: 0 0 0 2px var(--dsw-alias-brand-primary); outline: none; }
+.dsh-cost-sidebar .dsh-cost-sidebar-value {
+  color: var(--dsw-alias-label-primary);
+  font-variant-numeric: tabular-nums;
+}
+.dsh-cost-sidebar.warn .dsh-cost-sidebar-value { color: var(--dsw-alias-state-warn-primary); }
 .dsh-cost-section { display: flex; flex-direction: column; gap: 16px; padding: 4px 2px 24px; font-size: 13px; color: var(--dsw-alias-label-primary); }
 .dsh-cost-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 @media (max-width: 1023px) { .dsh-cost-cards { grid-template-columns: 1fr; } }
@@ -109,6 +100,7 @@ window.__ModuleLoader__.load({
         for (const listener of listeners) {
           try { listener(latestState) } catch { /* 单订阅者异常不断链 */ }
         }
+        renderSessionAnchor()
       } catch { /* 服务端未就绪：静默，下轮再试 */ }
     }
 
@@ -173,27 +165,88 @@ window.__ModuleLoader__.load({
       return (row.input ?? 0) + (row.output ?? 0) + (row.cacheRead ?? 0) + (row.cacheWrite ?? 0) + (row.reasoning ?? 0)
     }
 
-    /* -- 界面一：本会话费用 chip -------------------------------------- */
+    /* -- 界面一：宿主状态行末尾的会话费用 ------------------------------ */
 
-    function SessionCost({ sessionId }) {
-      const state = useCostState()
-      useTurnEnd(() => { void pollOnce() })
-      const session = React.useMemo(() => {
-        if (!state || !sessionId || !Array.isArray(state.sessions)) return null
-        return state.sessions.find((item) => item.id === sessionId) ?? null
-      }, [state, sessionId])
-      if (!sessionId || !session) return null
-      const title = `${session.calls} 次调用 · 输入 ${session.input ?? 0} · 输出 ${session.output ?? 0}`
-      return h('button', {
-        type: 'button',
-        className: 'dsh-cost-chip',
-        'data-live': '1',
-        title,
-        onClick: () => { void pollOnce() },
-      }, h('span', { className: 'dsh-cost-amount' }, moneyOf(state, session.cost)))
+    /**
+     * 会话 id 感知器：input.dock 槽位组件只用来拿标准 props 里的 sessionId
+     * （渲染 null），写进模块级变量供锚定 span 读取；切会话即时更新。
+     */
+    let currentSessionId = ''
+    const sessionWatchers = new Set()
+
+    function SessionIdSensor({ sessionId }) {
+      React.useEffect(() => {
+        currentSessionId = typeof sessionId === 'string' ? sessionId : ''
+        for (const notify of sessionWatchers) {
+          try { notify() } catch { /* 单订阅者异常不断链 */ }
+        }
+      }, [sessionId])
+      return null
     }
 
-    /* -- 界面二：侧栏今日费用 ----------------------------------------- */
+    /**
+     * 锚定进宿主会话指标行（「5 轮 31 步 · 207 tok/s · … 缓存命中 88%」）。
+     * compaction-control 0.1.7 同款思路：React/宿主都不管理我们的 span 位置，
+     * span 断线（宿主整行重建）时 MutationObserver 重挂；找不到特征行就不渲染
+     * （宁缺毋滥，不在官方容器外悬空）。
+     */
+    const sessionAnchor = { span: null, observer: null, state: null }
+
+    function sessionCostText() {
+      const state = sessionAnchor.state
+      if (!state || !currentSessionId || !Array.isArray(state.sessions)) return ''
+      const session = state.sessions.find((item) => item.id === currentSessionId)
+      if (!session) return ''
+      return ` · ${moneyOf(state, session.cost)}`
+    }
+
+    function renderSessionAnchor() {
+      const span = sessionAnchor.span
+      if (!span || !span.isConnected) return
+      span.textContent = sessionCostText()
+      span.style.display = span.textContent ? '' : 'none'
+    }
+
+    /** 找宿主状态行：含「缓存命中」或「tok/s」文案的文本节点 → 其父元素的父级（行容器）。 */
+    function findStatusRow() {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const text = node.textContent ?? ''
+        if (!text.includes('缓存命中') && !text.includes('tok/s')) continue
+        const textParent = node.parentElement
+        if (!textParent) continue
+        return textParent.parentElement ?? textParent
+      }
+      return null
+    }
+
+    function mountSessionAnchor() {
+      // 已挂且仍在文档中：不重复锚。
+      if (sessionAnchor.span?.isConnected) return
+      const row = findStatusRow()
+      if (!row) return
+      const span = document.createElement('span')
+      span.className = 'dsh-cost-inline'
+      span.textContent = sessionCostText()
+      // 官方行尾若有按钮（ContextMeter 圆环），插到按钮前；否则排在行末。
+      const lastButton = row.querySelector(':scope > button:last-child')
+      if (lastButton) row.insertBefore(span, lastButton)
+      else row.appendChild(span)
+      sessionAnchor.span = span
+    }
+
+    function startSessionAnchor() {
+      mountSessionAnchor()
+      sessionAnchor.observer = new MutationObserver(() => {
+        // 只处理我们 span 断线（宿主重建状态行）的情况，防自触发循环。
+        if (sessionAnchor.span?.isConnected) return
+        sessionAnchor.span = null
+        mountSessionAnchor()
+      })
+      sessionAnchor.observer.observe(document.body, { childList: true, subtree: true })
+    }
+
+    /* -- 界面二：侧栏今日费用（分隔线 + 左右对齐行） -------------------- */
 
     function TodayCost() {
       const state = useCostState()
@@ -205,11 +258,12 @@ window.__ModuleLoader__.load({
       const overBudget = state.budget && state.budget.usedPct >= 0.8
       return h('button', {
         type: 'button',
-        className: 'dsh-cost-today',
+        className: 'dsh-cost-sidebar' + (overBudget ? ' warn' : ''),
         title,
-        style: overBudget ? { color: 'var(--dsw-alias-state-warn-primary)' } : undefined,
         onClick: () => { void pollOnce() },
-      }, h('span', null, `今日 ${moneyOf(state, today?.cost ?? 0)}`))
+      },
+      h('span', null, '今日'),
+      h('span', { className: 'dsh-cost-sidebar-value' }, moneyOf(state, today?.cost ?? 0)))
     }
 
     /* -- 界面三：设置页「费用」分节 ------------------------------------ */
@@ -305,12 +359,15 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         ensureStyle()
         startPoller()
-        console.info('[dsh-cost] client 0.2.0 active')
+        startSessionAnchor()
+        sessionWatchers.add(renderSessionAnchor)
+        console.info('[dsh-cost] client 0.3.0 active')
+        // 只当 sessionId 感知器（渲染 null），费用本体锚定在宿主状态行末尾。
         ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
           name: 'conversation.input.dock',
           id: 'dsh-cost-session',
           order: 90,
-        }, SessionCost))
+        }, SessionIdSensor))
         ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
           name: 'sidebar.footer.action',
           id: 'dsh-cost-today',

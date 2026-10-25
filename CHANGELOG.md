@@ -2,6 +2,23 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-10-25
+
+### UI 重构：费用信息隐入官方布局（真机截图反馈）
+
+- **本会话费用锚定进宿主会话指标行**：`5 轮 31 步 · 207 tok/s · … 缓存命中
+  88%` 行末尾追加 `· ¥0.12`（ContextMeter 圆环按钮之前），官方 tabular-nums
+  小字样式，零新增容器。compaction-control 0.1.7 同款自锚定：span 断线
+  （宿主整行重建）由 MutationObserver 重挂；找不到特征行（「缓存命中」/
+  「tok/s」文案）就不渲染，不在官方容器外悬空。
+- sessionId 由隐形槽位感知器提供（input.dock 槽组件渲染 null 只拿标准
+  props），切会话即时刷新金额。
+- **侧栏今日费用重做**：细分隔线 + `今日 ……… ¥0.12` 左右对齐行（与侧栏
+  条目同宽、label-secondary/primary、tabular-nums），hover 出调用数/token/
+  峰谷明细，点击立即刷新，预算超阈金额变警告色。
+- 移除旧的 input.dock 费用 chip 与侧栏居中小字样式。
+- 纯客户端改动：Ctrl+R 刷新窗口即生效。
+
 ## [0.2.0] - 2026-10-25
 
 ### 正确性与数据完整性（对照 dsh-cost-meter 差距分析第一层）
