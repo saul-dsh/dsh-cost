@@ -143,9 +143,10 @@ window.__ModuleLoader__.load({
   cursor: pointer;
   transition: background 120ms ease, color 120ms ease;
 }
+/* 内联写了 background: transparent 兜底，hover 必须 !important 才盖得住 */
 .dsh-cost-pill:hover,
 .dsh-cost-pill[aria-expanded="true"] {
-  background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.08));
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.08)) !important;
   color: var(--dsw-alias-label-secondary, rgba(232, 238, 250, 0.72));
 }
 .dsh-cost-pill svg { width: 14px; height: 14px; flex: none; }
@@ -792,22 +793,42 @@ body[data-ds-dark-theme] .dsh-cost-pop {
         return () => window.clearInterval(timer)
       }, [])
       const state = latestState
-      return h('span', { className: 'dsh-cost-pill-anchor', ref: anchorRef },
-        h('button', {
-          type: 'button',
-          className: 'dsh-cost-pill',
-          'aria-expanded': open ? 'true' : 'false',
-          title: '费用明细',
-          onClick: () => {
-            if (overviewPop) { closeOverviewPop(); setOpen(false); return }
-            setOpen(true)
-            void openOverviewPop(anchorRef.current)
-          },
+      // 不用图标：宿主的 dock 对 svg 没有约束，一旦样式没跟上就撑成方块。
+      // 关键排版用内联兜底，不依赖外部 CSS 是否已注入。
+      return h('span', {
+        className: 'dsh-cost-pill-anchor',
+        ref: anchorRef,
+        style: { display: 'inline-flex', alignItems: 'center' },
+      },
+      h('button', {
+        type: 'button',
+        className: 'dsh-cost-pill',
+        'aria-expanded': open ? 'true' : 'false',
+        title: '费用明细',
+        style: {
+          display: 'inline-flex',
+          flexDirection: 'row',
+          alignItems: 'center',
+          width: 'auto',
+          height: 'auto',
+          minWidth: 0,
+          padding: '1px 8px',
+          border: 'none',
+          borderRadius: '8px',
+          background: 'transparent',
+          color: 'inherit',
+          font: 'inherit',
+          fontVariantNumeric: 'tabular-nums',
+          lineHeight: '20px',
+          whiteSpace: 'nowrap',
+          cursor: 'pointer',
         },
-        h('svg', { viewBox: '0 0 16 16', 'aria-hidden': true },
-          h('circle', { cx: 8, cy: 8, r: 6.2, fill: 'none', stroke: 'currentColor', 'stroke-width': 1.4 }),
-          h('path', { d: 'M8 4.8v3.4l2.2 1.4', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.4, 'stroke-linecap': 'round' })),
-        h('span', null, state ? moneyOf(state, state.total?.cost ?? 0) : '—')))
+        onClick: () => {
+          if (overviewPop) { closeOverviewPop(); setOpen(false); return }
+          setOpen(true)
+          void openOverviewPop(anchorRef.current)
+        },
+      }, state ? moneyOf(state, state.total?.cost ?? 0) : '—'))
     }
 
     function CostSection() {
