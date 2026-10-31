@@ -713,7 +713,7 @@ export function apply(ctx, config) {
 
   const lockPath = join(STORE_DIR, 'ledger.lock')
   const lock = acquireLedgerLock(lockPath)
-  void report(`server boot v0.7.0 pid=${process.pid} ledgerOwner=${lock.owner} retention=${config.retentionDays} rate=${config.exchangeRate} budget=${config.budgetEnabled ? `${config.budgetAmount}/${config.budgetPeriod}` : 'off'} backfill=${config.backfillEnabled && lock.owner ? 'on' : 'off'}`)
+  void report(`server boot v0.8.0 pid=${process.pid} ledgerOwner=${lock.owner} retention=${config.retentionDays} rate=${config.exchangeRate} budget=${config.budgetEnabled ? `${config.budgetAmount}/${config.budgetPeriod}` : 'off'} backfill=${config.backfillEnabled && lock.owner ? 'on' : 'off'}`)
 
   const ledger = createLedger(config.retentionDays)
   if (lock.owner) ledger.load()
@@ -769,6 +769,24 @@ export function apply(ctx, config) {
     ctx.effect(() => () => clearTimeout(backfillTimer), 'dsh-cost: backfill timer')
   }
 
+  // 汇率自动刷新：仅锁持有者，启动 5s 后首刷，之后每小时。失败静默（用旧值）。
+  if (lock.owner) {
+    const refreshRate = async () => {
+      try {
+        const rate = await fetchExchangeRate()
+        ledger.setExchangeRate(rate, Date.now())
+        void report(`exchange rate auto: ${rate}`)
+      } catch (error) {
+        void report(`exchange rate auto failed: ${String(error?.message ?? error).slice(0, 120)}`)
+      }
+    }
+    const rateStart = setTimeout(() => { void refreshRate() }, 5000)
+    rateStart.unref?.()
+    const rateTimer = setInterval(() => { void refreshRate() }, 3_600_000)
+    rateTimer.unref?.()
+    ctx.effect(() => () => { clearTimeout(rateStart); clearInterval(rateTimer) }, 'dsh-cost: exchange rate timers')
+  }
+
   /** 深度标记：存在即「已知会、不需要再入账」的 llm 流（嵌套排除）。 */
   const llmDepth = new AsyncLocalStorage()
 
@@ -814,7 +832,16 @@ export function apply(ctx, config) {
     if (model && config.customPrices && config.customPrices[model]) return { custom: true, ...config.customPrices[model] }
     const norm = normalizeModelId(model)
     if (legacyOnlyModels[norm]) return legacyOnlyModels[norm]
-    if (norm.includes('deepseek')) return norm.includes('pro') ? deepseekPro : deepseekFlash
+    if (norm.includes('deepseek')) {
+      // 官方同步的现行价优先（fetch-prices 成功后覆盖内置表；历史档不变）。
+      const live = ledger.livePrices()
+      if (live && live.currency === 'USD') {
+        const family = norm.includes('pro') ? 'pro' : 'flash'
+        const t = live[family]
+        return { legacyBase: (norm.includes('pro') ? deepseekPro : deepseekFlash).legacyBase, august: undefined, offPeak: t.offPeak, peak: t.peak, live: true }
+      }
+      return norm.includes('pro') ? deepseekPro : deepseekFlash
+    }
     return null
   }
 
@@ -962,7 +989,7 @@ export function apply(ctx, config) {
             : 0
           send(200, {
             serverNow: now,
-            display: { currency: 'CNY', rate: config.exchangeRate },
+            display: { currency: 'CNY', rate: ledger.liveExchangeRate()?.rate ?? config.exchangeRate, rateSource: ledger.liveExchangeRate() ? 'auto' : 'config', rateFetchedAt: ledger.liveExchangeRate()?.fetchedAt ?? null },
             peak: { isPeak: isPeakAt(now), windows: PEAK_WINDOWS, nextSwitchAtMs: nextPeakSwitch(now)?.atMs ?? null, nextIsPeak: nextPeakSwitch(now)?.isPeak ?? null },
             today: todayKey in snap.days ? summarize(snap.days[todayKey]) : null,
             month,
@@ -1075,24 +1102,56 @@ export function apply(ctx, config) {
           res.statusCode = 200
           res.setHeader('content-type', 'application/json')
           res.setHeader('content-disposition', 'attachment; filename="dsh-cost-ledger.json"')
-          res.end(JSON.stringify({ exportedAt: Date.now(), display: { currency: 'CNY', rate: config.exchangeRate }, days: snap.days }))
+          res.end(JSON.stringify({ exportedAt: Date.now(), display: { currency: 'CNY', rate: ledger.liveExchangeRate()?.rate ?? config.exchangeRate }, days: snap.days }))
           return
         }
 
         if (path === '/prices' && req.method === 'GET') {
           const now = Date.now()
           const peak = isPeakAt(now)
+          const live = ledger.livePrices()
           send(200, {
             currency: 'USD',
             peak,
             peakWindowsUtc: PEAK_WINDOWS,
             holidays: [...PEAK_HOLIDAYS],
+            source: live ? 'official-sync' : 'built-in',
+            fetchedAt: live?.fetchedAt ?? null,
             models: {
-              'deepseek-v4.1-flash / deepseek-flash': currentTier(deepseekFlash, now, peak),
-              'deepseek-v4-pro': currentTier(deepseekPro, now, peak),
+              'deepseek-v4.1-flash / deepseek-flash': live ? tierFor({ offPeak: live.flash.offPeak, peak: live.flash.peak }, now, peak) : currentTier(deepseekFlash, now, peak),
+              'deepseek-v4-pro': live ? tierFor({ offPeak: live.pro.offPeak, peak: live.pro.peak }, now, peak) : currentTier(deepseekPro, now, peak),
             },
-            default: currentTier(deepseekFlash, now, peak),
+            default: live ? tierFor({ offPeak: live.flash.offPeak, peak: live.flash.peak }, now, peak) : currentTier(deepseekFlash, now, peak),
           })
+          return
+        }
+
+        // 官方价格同步：抓官方定价页解析，校验峰=谷×2 后覆盖现行档。
+        if (path === '/fetch-prices' && req.method === 'POST') {
+          try {
+            const parsed = await fetchOfficialPricing()
+            const tiers = tiersFromOfficial(parsed)
+            ledger.setLivePrices(tiers)
+            void report(`price sync ok: flash off ${JSON.stringify(tiers.flash.offPeak)} pro off ${JSON.stringify(tiers.pro.offPeak)}`)
+            send(200, { ok: true, fetchedAt: tiers.fetchedAt, flash: tiers.flash, pro: tiers.pro })
+          } catch (error) {
+            void report(`price sync failed: ${String(error?.message ?? error).slice(0, 200)}`)
+            send(502, { ok: false, error: String(error?.message ?? error).slice(0, 200) })
+          }
+          return
+        }
+
+        // 汇率手动刷新（自动刷新由每小时定时器执行）。
+        if (path === '/fetch-rate' && req.method === 'POST') {
+          try {
+            const rate = await fetchExchangeRate()
+            ledger.setExchangeRate(rate, Date.now())
+            void report(`exchange rate ok: ${rate}`)
+            send(200, { ok: true, rate })
+          } catch (error) {
+            void report(`exchange rate failed: ${String(error?.message ?? error).slice(0, 200)}`)
+            send(502, { ok: false, error: String(error?.message ?? error).slice(0, 200) })
+          }
           return
         }
 

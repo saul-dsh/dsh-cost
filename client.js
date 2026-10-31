@@ -333,7 +333,7 @@ body[data-ds-dark-theme] .dsh-cost-pop {
      * span 断线（宿主整行重建）时 MutationObserver 重挂；找不到特征行就不渲染
      * （宁缺毋滥，不在官方容器外悬空）。
      */
-    const sessionAnchor = { span: null, host: null, observer: null, state: null }
+    const sessionAnchor = { span: null, host: null, observer: null, state: null, lastFailLog: 0 }
 
     function sessionCostText() {
       const state = latestState
@@ -391,7 +391,14 @@ body[data-ds-dark-theme] .dsh-cost-pop {
       if (sessionAnchor.host?.isConnected) return
       const row = findStatusRow()
       if (!row) {
-        void clientDebug('anchor: status row not found (no visible tok/s text)')
+        // 失败节流：MutationObserver 每次页面变动都会进到这里，不节流会
+        // 每秒刷几十条 debug 日志（真机曾积累 3002 条）。首见记一条，
+        // 之后每 5 分钟最多记一次。
+        const now = Date.now()
+        if (!sessionAnchor.lastFailLog || now - sessionAnchor.lastFailLog > 300_000) {
+          sessionAnchor.lastFailLog = now
+          void clientDebug('anchor: status row not found (no visible tok/s text; throttled 5m)')
+        }
         return
       }
       // 插到状态行的**兄弟位置**（compaction-control 0.1.7 教训：append 进
@@ -912,6 +919,37 @@ body[data-ds-dark-theme] .dsh-cost-pop {
       }
       footerBits.push(h('button', { className: 'dsh-cost-badge action', key: 'export-json', title: '导出全部费用记录（JSON）', onClick: () => downloadExport('json') }, '导出 JSON'))
       footerBits.push(h('button', { className: 'dsh-cost-badge action', key: 'export-csv', title: '导出日汇总（CSV）', onClick: () => downloadExport('csv') }, '导出 CSV'))
+      // 官方价格同步 + 汇率刷新（点击后按钮短暂显示结果，再自动复原）。
+      const [syncNote, setSyncNote] = React.useState('')
+      React.useEffect(() => {
+        if (!syncNote) return
+        const timerId = setTimeout(() => setSyncNote(''), 4000)
+        return () => clearTimeout(timerId)
+      }, [syncNote])
+      const postSync = async (endpoint, okLabel) => {
+        try {
+          const res = await fetch(`${ENDPOINT}/${endpoint}`, { method: 'POST' })
+          const data = await res.json().catch(() => null)
+          if (res.ok && data?.ok) setSyncNote(okLabel)
+          else setSyncNote(`失败：${data?.error ?? res.status}`)
+          if (res.ok) void pollOnce()
+        } catch (error) { setSyncNote(`失败：${String(error?.message ?? error).slice(0, 60)}`) }
+      }
+      footerBits.push(h('button', {
+        className: 'dsh-cost-badge action',
+        key: 'sync-prices',
+        title: '从官方定价页同步现行价格（峰谷两档，历史账目不受影响）',
+        onClick: () => { void postSync('fetch-prices', '价格已同步') },
+      }, '同步官方价格'))
+      footerBits.push(h('button', {
+        className: 'dsh-cost-badge action',
+        key: 'sync-rate',
+        title: '立即刷新 USD→CNY 汇率（平时每小时自动刷新）',
+        onClick: () => { void postSync('fetch-rate', '汇率已刷新') },
+      }, '刷新汇率'))
+      if (syncNote) {
+        footerBits.push(h('span', { className: 'dsh-cost-badge', key: 'sync-note' }, syncNote))
+      }
       return h('div', { className: 'dsh-cost-section' },
         h(BudgetCard, { state }),
         cards,
@@ -931,7 +969,7 @@ body[data-ds-dark-theme] .dsh-cost-pop {
         startSessionAnchor()
         startUsageAnchors()
         sessionWatchers.add(renderSessionAnchor)
-        console.info('[dsh-cost] client 0.6.0 active')
+        console.info('[dsh-cost] client 0.8.0 active')
         // 只当 sessionId 感知器（渲染 null），费用本体锚定在宿主状态行末尾。
         ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
           name: 'conversation.input.dock',

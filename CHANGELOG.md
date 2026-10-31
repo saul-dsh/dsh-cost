@@ -2,6 +2,25 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.1] - 2026-10-31
+
+### 完成官方价格同步链路 + 日志卫生
+
+- **价格同步端到端打通**（0.8.0 只落了解析器，接线缺失）：新增
+  `POST /api/dsh-cost/fetch-prices`（抓官方定价页 → 解析 12 个价格 →
+  校验峰=谷×2 → 存入 ledger.live 覆盖现行档，历史档不动）与
+  `POST /api/dsh-cost/fetch-rate`（frankfurter.dev 手动刷新）；
+  priceEntryFor 优先吃同步价；/prices 标注来源（official-sync /
+  built-in）。**真机 e2e 验证**：真实抓取官方页解析出全部 12 个价格，
+  与内置表逐分一致（同步目前为 no-op，官方调价时自动跟上）。
+- **汇率自动刷新**：锁持有者启动 5s 首刷 + 每小时刷 frankfurter
+  USD→CNY；/state 下发 `rate/rateSource/rateFetchedAt`，导出随行。
+- **设置页新增「同步官方价格」「刷新汇率」按钮**（带 4s 结果提示，
+  成功后立即重拉 /state）。
+- **日志卫生**：anchor 找不到状态行的失败日志节流到 5 分钟一条
+  （真机曾积累 3002 条）；修正三处版本字符串漂移（boot/控制台日志
+  跟随 package.json：cost 0.8.x、followup 0.3.2、enhancer 0.2.6）。
+
 ## [0.8.0] - 2026-10-25
 
 ### 新增
