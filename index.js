@@ -691,6 +691,9 @@ function releaseLedgerLock(path) {
 /* ------------------------------------------------------------------ */
 export const inject = []
 
+/** 官方余额查询：host 白名单（安全约束——只允许官方域名，内网/环回不可能出现）。 */
+const BALANCE_HOST = 'api.deepseek.com'
+
 export const Config = Schema.object({
   enabled: Schema.boolean().default(true).description('是否启用费用统计'),
   /** 展示汇率（USD → CNY）；金额账本恒存美元，展示时换算。 */
@@ -706,16 +709,20 @@ export const Config = Schema.object({
   peakAlertEnabled: Schema.boolean().default(false).description('峰谷切换前提醒'),
   peakAlertLeadMinutes: Schema.number().default(2).description('峰谷切换提前量（分钟，1-30）'),
   peakAlertNotify: Schema.boolean().default(false).description('同时发送系统通知'),
+  /** DeepSeek 开放平台 API Key（选填）：配置后费用弹卡显示官方账户余额。 */
+  apiKey: Schema.string().default('').description('DeepSeek 开放平台 API Key（查官方余额用，可选）'),
 })
 
 export function apply(ctx, config) {
   // 运行时可变副本：POST /settings 改这里，立即生效；显式改过的键持久化
   // 到 storages、启动时回放（没改过的键继续跟随宿主配置）。
   const live = { ...config }
+  // 官方余额缓存：10 分钟内直接回缓存；换 key 即失效。
+  let balanceCache = null
   if (!live.enabled) return
 
   // 设置持久化：只落与 config 不同的键，防抖 400ms 原子写。
-  const SETTINGS_KEYS = ['budgetEnabled', 'budgetAmount', 'budgetPeriod', 'peakAlertEnabled', 'peakAlertNotify', 'peakAlertLeadMinutes', 'exchangeRate']
+  const SETTINGS_KEYS = ['budgetEnabled', 'budgetAmount', 'budgetPeriod', 'peakAlertEnabled', 'peakAlertNotify', 'peakAlertLeadMinutes', 'exchangeRate', 'apiKey']
   const SETTINGS_PATH = join(homedir(), '.dsh', 'storages', 'dsh-cost', 'settings.json')
   try {
     const saved = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8'))
@@ -1016,6 +1023,10 @@ export function apply(ctx, config) {
             const value = Number(body.peakAlertLeadMinutes)
             if (Number.isFinite(value)) live.peakAlertLeadMinutes = Math.min(30, Math.max(1, Math.round(value)))
           }
+          if (body.apiKey !== undefined) {
+            live.apiKey = String(body.apiKey ?? '').trim()
+            balanceCache = null // 换 key 立即失效缓存
+          }
           persistSettings()
           send(200, { ok: true })
           return
@@ -1259,6 +1270,33 @@ export function apply(ctx, config) {
           } catch (error) {
             void report(`price sync failed: ${String(error?.message ?? error).slice(0, 200)}`)
             send(502, { ok: false, error: String(error?.message ?? error).slice(0, 200) })
+          }
+          return
+        }
+
+        // 官方余额（选配 apiKey）：host 白名单写死官方域名，https 证书校验兜底。
+        if (path === '/balance' && req.method === 'GET') {
+          const key = String(live.apiKey ?? '').trim()
+          if (!key) { send(200, { ok: false, reason: 'no-key' }); return }
+          if (balanceCache && Date.now() - balanceCache.at < 600_000) { send(200, balanceCache.data); return }
+          if (BALANCE_HOST !== 'api.deepseek.com') { send(200, { ok: false, reason: 'bad-host' }); return }
+          try {
+            const res = await fetch(`https://${BALANCE_HOST}/user/balance`, {
+              headers: { accept: 'application/json', authorization: `Bearer ${key}`, 'user-agent': 'dsh-cost' },
+              signal: AbortSignal.timeout(8000),
+            })
+            if (!res.ok) throw new Error(`balance ${res.status}`)
+            const data = await res.json()
+            const info = Array.isArray(data.balance_infos) ? data.balance_infos[0] : null
+            const out = info
+              ? { ok: true, currency: info.currency ?? 'CNY', total: String(info.total_balance ?? ''), granted: String(info.granted_balance ?? ''), toppedUp: String(info.topped_up_balance ?? ''), at: Date.now() }
+              : { ok: false, reason: 'empty' }
+            balanceCache = { at: Date.now(), data: out }
+            send(200, out)
+          } catch (error) {
+            const out = { ok: false, reason: String(error?.message ?? error).slice(0, 120) }
+            balanceCache = { at: Date.now(), data: out }
+            send(200, out)
           }
           return
         }

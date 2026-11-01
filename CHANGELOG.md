@@ -2,6 +2,18 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.0] - 2026-11-01
+
+### 官方余额（费用弹卡新行）
+
+- Config 新增可选 `apiKey`（DeepSeek 开放平台 API Key，可在宿主插件设置或
+  POST /settings 配置，随 settings.json 持久化；换 key 立即失效缓存）。
+- 新端点 GET /balance：host 白名单写死 api.deepseek.com（https + 证书校验
+  兜底，内网/环回不可能出现），10 分钟缓存，8 秒超时，失败原因内联返回。
+- 费用弹卡顶部异步补「官方余额」行（CNY 原值展示，不走 USD 换算）；未配置
+  key 或查询失败整行不占位。调用明细弹窗此前已存在（/calls + 最近调用行），
+  本版不再重复建设。
+
 ## [0.8.3] - 2026-11-01
 
 ### 预算超限系统通知

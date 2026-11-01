@@ -776,6 +776,25 @@ body[data-ds-dark-theme] .dsh-cost-pop {
       head.append(title, sum)
       box.appendChild(head)
 
+      // 官方余额（选配 apiKey）：打开弹卡后异步补一行；未配置/失败整行不占位。
+      const balRow = document.createElement('div')
+      balRow.className = 'dsh-cost-src'
+      const balName = document.createElement('span')
+      balName.className = 'name'
+      balName.textContent = '官方余额'
+      const balNum = document.createElement('span')
+      balNum.className = 'num'
+      balNum.textContent = '…'
+      balRow.append(balName, balNum)
+      box.appendChild(balRow)
+      void fetch(`${ENDPOINT}/balance`, { cache: 'no-store' })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((bal) => {
+          if (bal?.ok && bal.total !== '') balNum.textContent = `${bal.currency} ${bal.total}`
+          else balRow.remove()
+        })
+        .catch(() => balRow.remove())
+
       const bySource = data.total?.bySource ?? {}
       const order = ['chat', 'enhance', 'followup']
       const keys = [
