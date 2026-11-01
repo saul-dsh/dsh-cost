@@ -238,6 +238,32 @@ body[data-ds-dark-theme] .dsh-cost-pop {
     let latestState = null
     let timer = 0
 
+    /** 预算超限系统通知：跨线 100% 时每周期弹一次（80% 只走 UI 变色不打扰）。 */
+    let budgetNoticeKey = null
+    function notifyBudgetOnce(state) {
+      try {
+        const budget = state?.budget
+        if (!budget || !(budget.usedPct >= 1)) return
+        const key = `${budget.period}:${budget.amount}`
+        if (budgetNoticeKey === key) return
+        budgetNoticeKey = key
+        if (typeof Notification === 'undefined') return
+        const periodLabel = budget.period === 'day' ? '今日' : budget.period === 'month' ? '本月' : '累计'
+        const fire = () => {
+          try {
+            const n = new Notification('dsh 费用预算已超限', {
+              body: `${periodLabel}费用 ¥${Number(budget.used).toFixed(2)}，已达预算 ¥${Number(budget.amount).toFixed(2)} 的 ${(budget.usedPct * 100).toFixed(0)}%。`,
+            })
+            n.onclick = () => { window.focus?.(); n.close() }
+          } catch { /* 通知不可用：UI 超限变色兜底 */ }
+        }
+        if (Notification.permission === 'granted') fire()
+        else if (Notification.permission === 'default') {
+          void Notification.requestPermission?.().then((p) => { if (p === 'granted') fire() }).catch(() => {})
+        }
+      } catch { /* ignore */ }
+    }
+
     async function pollOnce() {
       try {
         const res = await fetch(`${ENDPOINT}/state`, { cache: 'no-store' })
@@ -245,6 +271,7 @@ body[data-ds-dark-theme] .dsh-cost-pop {
         const data = await res.json()
         if (!data || typeof data !== 'object') return
         latestState = data
+        notifyBudgetOnce(latestState)
         for (const listener of listeners) {
           try { listener(latestState) } catch { /* 单订阅者异常不断链 */ }
         }
