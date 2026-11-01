@@ -709,13 +709,39 @@ export const Config = Schema.object({
 })
 
 export function apply(ctx, config) {
-  if (!config.enabled) return
+  // 运行时可变副本：POST /settings 改这里，立即生效；显式改过的键持久化
+  // 到 storages、启动时回放（没改过的键继续跟随宿主配置）。
+  const live = { ...config }
+  if (!live.enabled) return
+
+  // 设置持久化：只落与 config 不同的键，防抖 400ms 原子写。
+  const SETTINGS_KEYS = ['budgetEnabled', 'budgetAmount', 'budgetPeriod', 'peakAlertEnabled', 'peakAlertNotify', 'peakAlertLeadMinutes', 'exchangeRate']
+  const SETTINGS_PATH = join(homedir(), '.dsh', 'storages', 'dsh-cost', 'settings.json')
+  try {
+    const saved = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8'))
+    for (const key of SETTINGS_KEYS) if (saved?.[key] !== undefined) live[key] = saved[key]
+  } catch { /* 无存档：全部跟随配置 */ }
+  let settingsTimer = null
+  const persistSettings = () => {
+    if (settingsTimer) return
+    settingsTimer = setTimeout(() => {
+      settingsTimer = null
+      try {
+        mkdirSync(dirname(SETTINGS_PATH), { recursive: true })
+        const out = {}
+        for (const key of SETTINGS_KEYS) if (live[key] !== config[key]) out[key] = live[key]
+        const tmp = `${SETTINGS_PATH}.tmp`
+        writeFileSync(tmp, JSON.stringify(out, null, 2))
+        renameSync(tmp, SETTINGS_PATH)
+      } catch { /* ignore */ }
+    }, 400)
+  }
 
   const lockPath = join(STORE_DIR, 'ledger.lock')
   const lock = acquireLedgerLock(lockPath)
-  void report(`server boot v0.8.0 pid=${process.pid} ledgerOwner=${lock.owner} retention=${config.retentionDays} rate=${config.exchangeRate} budget=${config.budgetEnabled ? `${config.budgetAmount}/${config.budgetPeriod}` : 'off'} backfill=${config.backfillEnabled && lock.owner ? 'on' : 'off'}`)
+  void report(`server boot v0.8.2 pid=${process.pid} ledgerOwner=${lock.owner} retention=${live.retentionDays} rate=${live.exchangeRate} budget=${live.budgetEnabled ? `${live.budgetAmount}/${live.budgetPeriod}` : 'off'} backfill=${live.backfillEnabled && lock.owner ? 'on' : 'off'}`)
 
-  const ledger = createLedger(config.retentionDays)
+  const ledger = createLedger(live.retentionDays)
   if (lock.owner) ledger.load()
   ctx.effect(() => { ledger.dispose(); if (lock.owner) releaseLedgerLock(lockPath) }, 'dsh-cost: ledger flush + lock release')
 
@@ -763,7 +789,7 @@ export function apply(ctx, config) {
 
   // 历史回填：仅锁持有者执行（boot 后 3s，避开宿主启动高峰）；0.7.0 起
   // 改写 journal（与实时同源），由 ingest 统一折叠 + 指纹去重，天然不重。
-  if (config.backfillEnabled && lock.owner) {
+  if (live.backfillEnabled && lock.owner) {
     const backfillTimer = setTimeout(() => { void runBackfill(journal, ledger, priceEntryFor).catch((error) => { void report(`backfill crashed: ${String(error?.message ?? error).slice(0, 200)}`) }) }, 3000)
     backfillTimer.unref?.()
     ctx.effect(() => () => clearTimeout(backfillTimer), 'dsh-cost: backfill timer')
@@ -829,7 +855,7 @@ export function apply(ctx, config) {
   let accountCount = 0
 
   function priceEntryFor(model) {
-    if (model && config.customPrices && config.customPrices[model]) return { custom: true, ...config.customPrices[model] }
+    if (model && live.customPrices && live.customPrices[model]) return { custom: true, ...live.customPrices[model] }
     const norm = normalizeModelId(model)
     if (legacyOnlyModels[norm]) return legacyOnlyModels[norm]
     if (norm.includes('deepseek')) {
@@ -953,6 +979,48 @@ export function apply(ctx, config) {
           res.end(JSON.stringify(body))
         }
         const path = (req.url ?? '').split('?')[0].replace(/^\/api\/dsh-cost/, '')
+        if (path === '/settings' && req.method === 'GET') {
+          send(200, {
+            enabled: live.enabled,
+            exchangeRate: live.exchangeRate,
+            budgetEnabled: live.budgetEnabled,
+            budgetAmount: live.budgetAmount,
+            budgetPeriod: live.budgetPeriod,
+            peakAlertEnabled: live.peakAlertEnabled,
+            peakAlertLeadMinutes: live.peakAlertLeadMinutes,
+            peakAlertNotify: live.peakAlertNotify,
+            retentionDays: live.retentionDays,
+          })
+          return
+        }
+        // 运行时改参数：retentionDays 与 customPrices 不在白名单——前者启动时
+        // 已传给 createLedger，后者是对象结构，运行时改要么无效要么要重建缓存。
+        if (path === '/settings' && req.method === 'POST') {
+          let raw = ''
+          for await (const chunk of req) raw += chunk
+          let body
+          try { body = JSON.parse(raw) } catch { send(400, { error: 'invalid-json' }); return }
+          if (body.budgetEnabled !== undefined) live.budgetEnabled = body.budgetEnabled === true
+          if (body.budgetPeriod === 'day' || body.budgetPeriod === 'month') live.budgetPeriod = body.budgetPeriod
+          if (body.peakAlertEnabled !== undefined) live.peakAlertEnabled = body.peakAlertEnabled === true
+          if (body.peakAlertNotify !== undefined) live.peakAlertNotify = body.peakAlertNotify === true
+          if (body.budgetAmount !== undefined) {
+            const value = Number(body.budgetAmount)
+            if (Number.isFinite(value)) live.budgetAmount = Math.min(1_000_000, Math.max(0, value))
+          }
+          if (body.exchangeRate !== undefined) {
+            const value = Number(body.exchangeRate)
+            if (Number.isFinite(value) && value > 0) live.exchangeRate = Math.min(20, Math.max(1, value))
+          }
+          if (body.peakAlertLeadMinutes !== undefined) {
+            const value = Number(body.peakAlertLeadMinutes)
+            if (Number.isFinite(value)) live.peakAlertLeadMinutes = Math.min(30, Math.max(1, Math.round(value)))
+          }
+          persistSettings()
+          send(200, { ok: true })
+          return
+        }
+
 
         if (path === '/state' && req.method === 'GET') {
           const snap = await ledgerSnapshotFresh()
@@ -979,35 +1047,89 @@ export function apply(ctx, config) {
           }
           sessions.sort((a, b) => b.at - a.at)
           // 预算：以展示币种（CNY）计，used 由对应周期的账本金额换算。
-          const budgetReady = config.budgetEnabled && Number(config.budgetAmount) > 0
+          const budgetReady = live.budgetEnabled && Number(live.budgetAmount) > 0
           const budgetUsd = budgetReady
-            ? (config.budgetPeriod === 'day'
+            ? (live.budgetPeriod === 'day'
               ? (snap.days[todayKey]?.cost ?? 0)
-              : config.budgetPeriod === 'month'
+              : live.budgetPeriod === 'month'
                 ? (month?.cost ?? 0)
                 : total.cost)
             : 0
           send(200, {
             serverNow: now,
-            display: { currency: 'CNY', rate: ledger.liveExchangeRate()?.rate ?? config.exchangeRate, rateSource: ledger.liveExchangeRate() ? 'auto' : 'config', rateFetchedAt: ledger.liveExchangeRate()?.fetchedAt ?? null },
+            display: { currency: 'CNY', rate: ledger.liveExchangeRate()?.rate ?? live.exchangeRate, rateSource: ledger.liveExchangeRate() ? 'auto' : 'config', rateFetchedAt: ledger.liveExchangeRate()?.fetchedAt ?? null },
             peak: { isPeak: isPeakAt(now), windows: PEAK_WINDOWS, nextSwitchAtMs: nextPeakSwitch(now)?.atMs ?? null, nextIsPeak: nextPeakSwitch(now)?.isPeak ?? null },
             today: todayKey in snap.days ? summarize(snap.days[todayKey]) : null,
             month,
             total: summarize(total),
             budget: budgetReady
-              ? { amount: config.budgetAmount, period: config.budgetPeriod, used: budgetUsd * config.exchangeRate, usedPct: budgetUsd * config.exchangeRate / config.budgetAmount }
+              ? { amount: live.budgetAmount, period: live.budgetPeriod, used: budgetUsd * live.exchangeRate, usedPct: budgetUsd * live.exchangeRate / live.budgetAmount }
               : null,
             recent,
             sessions: sessions.slice(0, 20),
             unmatched: [...unmatchedModels],
             streamAlive: streamArmed,
             alerts: {
-              peakEnabled: config.peakAlertEnabled === true,
-              leadMinutes: Math.min(30, Math.max(1, Math.round(config.peakAlertLeadMinutes ?? 2))),
-              notify: config.peakAlertNotify === true,
+              peakEnabled: live.peakAlertEnabled === true,
+              leadMinutes: Math.min(30, Math.max(1, Math.round(live.peakAlertLeadMinutes ?? 2))),
+              notify: live.peakAlertNotify === true,
             },
           })
           return
+        }
+
+        /**
+         * GET /forecast —— 月底花费预测。
+         *
+         * 用最近 7 个**完整**历史日的日均推算，不用今天（半天数据会把均值拉低）。
+         * 样本少于 3 天时标 basis=insufficient，前端据此提示「数据不足」而不是
+         * 显示一个不可信的数字。
+         */
+        if (path === '/forecast' && req.method === 'GET') {
+          const snap = await ledgerSnapshotFresh()
+          const now = Date.now()
+          const todayKey = localDayKey(now)
+          const monthPrefix = todayKey.slice(0, 7)
+
+          let monthCost = 0
+          let monthCalls = 0
+          const recent = []
+
+          for (const key of Object.keys(snap.days).sort()) {
+            const day = snap.days[key]
+            if (key.startsWith(monthPrefix)) {
+              monthCost += day.cost ?? 0
+              monthCalls += day.calls ?? 0
+            }
+            // 只取完整历史日，今天的数据还在增长
+            if (key < todayKey && key >= localDayKey(now - 7 * 86400000)) {
+              recent.push({ date: key, cost: day.cost ?? 0, calls: day.calls ?? 0 })
+            }
+          }
+
+          const n = recent.length
+          const sumCost = recent.reduce((acc, d) => acc + d.cost, 0)
+          const sumCalls = recent.reduce((acc, d) => acc + d.calls, 0)
+          const avgDaily = n > 0 ? sumCost / n : 0
+          const avgCalls = n > 0 ? sumCalls / n : 0
+
+          const nowDate = new Date(now)
+          const daysInMonth = new Date(nowDate.getFullYear(), nowDate.getMonth() + 1, 0).getDate()
+          const daysLeft = daysInMonth - nowDate.getDate()
+          const projected = monthCost + avgDaily * daysLeft
+
+          return json({
+            monthCost,
+            monthCalls,
+            avgDaily,
+            avgCalls,
+            daysLeft,
+            projected,
+            avgPerCall: monthCalls > 0 ? monthCost / monthCalls : 0,
+            sampleDays: n,
+            basis: n >= 3 ? 'recent' : 'insufficient',
+            recent,
+          })
         }
 
         if (path === '/calls' && req.method === 'GET') {
@@ -1102,7 +1224,7 @@ export function apply(ctx, config) {
           res.statusCode = 200
           res.setHeader('content-type', 'application/json')
           res.setHeader('content-disposition', 'attachment; filename="dsh-cost-ledger.json"')
-          res.end(JSON.stringify({ exportedAt: Date.now(), display: { currency: 'CNY', rate: ledger.liveExchangeRate()?.rate ?? config.exchangeRate }, days: snap.days }))
+          res.end(JSON.stringify({ exportedAt: Date.now(), display: { currency: 'CNY', rate: ledger.liveExchangeRate()?.rate ?? live.exchangeRate }, days: snap.days }))
           return
         }
 

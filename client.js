@@ -202,6 +202,11 @@ body[data-ds-dark-theme] .dsh-cost-pop {
 .dsh-cost-card .dsh-cost-card-title { font-size: 12px; line-height: 20px; color: var(--dsw-alias-label-tertiary); }
 .dsh-cost-card .dsh-cost-card-value { font-size: 20px; line-height: 28px; font-weight: 500; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .dsh-cost-card .dsh-cost-card-sub { font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; }
+.dsh-cost-forecast { display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; border-radius: 10px; background: var(--dsw-alias-bg-layer-1, transparent); }
+.dsh-cost-forecast .dsh-cost-forecast-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.dsh-cost-forecast .dsh-cost-forecast-value { font-size: 20px; line-height: 28px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.dsh-cost-forecast .dsh-cost-forecast-sub { font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; }
+.dsh-cost-forecast[data-over="true"] .dsh-cost-forecast-value { color: #f87171; }
 .dsh-cost-table { display: flex; flex-direction: column; border-radius: 10px; background: var(--dsw-alias-bg-layer-1, transparent); overflow: hidden; }
 .dsh-cost-row { display: flex; align-items: center; gap: 12px; min-height: 30px; padding: 4px 14px; font-size: 12px; line-height: 20px; font-variant-numeric: tabular-nums; }
 .dsh-cost-row + .dsh-cost-row { border-top: 1px solid var(--dsw-alias-border-l3, transparent); }
@@ -262,6 +267,20 @@ body[data-ds-dark-theme] .dsh-cost-pop {
         return () => { listeners.delete(listener) }
       }, [])
       return state
+    }
+
+    /** 月底预测：数据变化慢，挂载时拉一次即可，不跟 poller 每 10 秒刷。 */
+    function useForecast() {
+      const [data, setData] = React.useState(null)
+      React.useEffect(() => {
+        let alive = true
+        fetch(`${ENDPOINT}/forecast`, { cache: 'no-store' })
+          .then((res) => (res.ok ? res.json() : null))
+          .then((value) => { if (alive) setData(value) })
+          .catch(() => {})
+        return () => { alive = false }
+      }, [])
+      return data
     }
 
     /* -- 回合落定感知（followup 同款：生成键从停止翻回发送） ---------- */
@@ -883,6 +902,24 @@ body[data-ds-dark-theme] .dsh-cost-pop {
 
     function CostSection() {
       const state = useCostState()
+      const forecast = useForecast()
+      const budgetAmount = state?.budget?.amount
+      const rate = state?.display?.rate ?? 7.2
+      const overBudget = forecast && forecast.basis === 'recent'
+        && Number.isFinite(budgetAmount) && budgetAmount > 0
+        && forecast.projected * rate > budgetAmount
+      const forecastCard = forecast && forecast.basis === 'recent'
+        ? h('div', { className: 'dsh-cost-forecast', 'data-over': String(!!overBudget) },
+          h('div', { className: 'dsh-cost-forecast-head' },
+            h('span', { className: 'dsh-cost-card-title' }, '月底预计'),
+            h('span', { className: 'dsh-cost-forecast-value' }, moneyOf(state, forecast.projected))),
+          h('div', { className: 'dsh-cost-forecast-sub' },
+            `已花 ${moneyOf(state, forecast.monthCost)} · 日均 ${moneyOf(state, forecast.avgDaily)} · 剩 ${forecast.daysLeft} 天${overBudget ? ' · 超出预算' : ''}`))
+        : forecast && forecast.basis === 'insufficient'
+          ? h('div', { className: 'dsh-cost-forecast' },
+            h('div', { className: 'dsh-cost-forecast-sub' },
+              `预测需要至少 3 天完整数据（当前 ${forecast.sampleDays ?? 0} 天）`))
+          : null
       const cards = h('div', { className: 'dsh-cost-cards' },
         h(CostCard, { title: '今日', row: state?.today, state }),
         h(CostCard, { title: '本月', row: state?.month, state }),
@@ -953,6 +990,7 @@ body[data-ds-dark-theme] .dsh-cost-pop {
       return h('div', { className: 'dsh-cost-section' },
         h(BudgetCard, { state }),
         cards,
+        forecastCard,
         recent,
         sessions,
         h(RecentCalls, { state }),
