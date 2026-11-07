@@ -694,6 +694,465 @@ export const inject = []
 /** 官方余额查询：host 白名单（安全约束——只允许官方域名，内网/环回不可能出现）。 */
 const BALANCE_HOST = 'api.deepseek.com'
 
+/* ------------------------------------------------------------------ */
+/* Coding Plan 订阅配额（对标 dsh-cost-meter lib/coding-plans.js 的      */
+/* Bearer 子集：端点/解析/降级链照抄上游，全部官方域名硬编码白名单）      */
+/* ------------------------------------------------------------------ */
+
+/** 0-100 已用百分比（保留 1 位）。 */
+const clampPct = (p) => Math.max(0, Math.min(100, Math.round(p * 10) / 10))
+
+/** 归一化百分比：0-1 视为小数，>=1 视为已是百分数；非法 → null。 */
+function normalizePercent(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return null
+  return clampPct(n <= 1 ? n * 100 : n)
+}
+
+/** 归一化重置时刻：unix 秒 / 毫秒 / ISO 字符串 → ISO 字符串；非法 → ''。 */
+function normalizeResetAt(value) {
+  if (typeof value === 'string' && value.length > 0) {
+    const ms = Date.parse(value)
+    if (Number.isFinite(ms)) return new Date(ms).toISOString()
+    const asNum = Number(value)
+    if (Number.isFinite(asNum) && asNum > 0) return new Date(asNum > 1e12 ? asNum : asNum * 1000).toISOString()
+    return ''
+  }
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return ''
+  return new Date(n > 1e12 ? n : n * 1000).toISOString()
+}
+
+/** 组装文本窗口（余额等无百分比的量）：text 空 → null。 */
+const textWindowOf = (text) => {
+  const s = String(text ?? '').trim()
+  return s.length > 0 ? { resetsAt: '', text: s } : null
+}
+
+/** 单窗口：utilization（0-100 或 0-1）+ resets（unix 秒/毫秒/ISO）。 */
+function windowOf(utilization, resetsAt) {
+  const percent = normalizePercent(utilization)
+  return percent === null ? null : { percent, resetsAt: normalizeResetAt(resetsAt) }
+}
+
+/** Anthropic：{ five_hour: { utilization, resets_at }, seven_day: {...}, ... }；子配额窗口丢弃。 */
+function parseAnthropicUsage(data) {
+  if (data === null || typeof data !== 'object') return null
+  const windows = {}
+  for (const [name, raw] of Object.entries(data)) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue
+    if (/^(five[_ -]?hour|seven[_ -]?day)[_ -]/i.test(name)) continue
+    if (name === 'iguana_necktie') continue
+    const win = windowOf(raw.utilization ?? raw.used_percentage, raw.resets_at ?? raw.reset_at)
+    if (win !== null) windows[name] = win
+  }
+  return Object.keys(windows).length > 0 ? windows : null
+}
+
+/** Z.ai / 智谱 GLM：monitor 端点 limits 数组（unit 3=小时档/6=周档）→ plans 数组 → 扁平窗口。 */
+function parseZaiUsage(data) {
+  if (data === null || typeof data !== 'object') return null
+  const windows = {}
+  const limits = data.data !== null && typeof data.data === 'object' && Array.isArray(data.data.limits)
+    ? data.data.limits : null
+  if (limits !== null) {
+    const monWindows = {}
+    const rest = []
+    for (const limit of limits) {
+      if (limit === null || typeof limit !== 'object' || (limit.type !== 'TOKENS_LIMIT' && limit.type !== 'CREDIT_LIMIT')) continue
+      const pct = limit.percentage !== undefined ? clampPct(Number(limit.percentage))
+        : Number.isFinite(Number(limit.usage)) && Number(limit.usage) > 0 && Number.isFinite(Number(limit.currentValue))
+          ? clampPct((Number(limit.currentValue) / Number(limit.usage)) * 100)
+          : null
+      if (pct === null) continue
+      const resetsAt = normalizeResetAt(limit.nextResetTime)
+      const unit = Number(limit.unit)
+      if (unit === 3 && monWindows.fiveHour === undefined) monWindows.fiveHour = { percent: pct, resetsAt }
+      else if (unit === 6 && monWindows.weekly === undefined) monWindows.weekly = { percent: pct, resetsAt }
+      else if (!Number.isFinite(unit)) rest.push({ pct, resetsAt, resetMs: Number(limit.nextResetTime) })
+    }
+    if (rest.length > 0) {
+      rest.sort((a, b) => {
+        const av = Number.isFinite(a.resetMs) && a.resetMs > 0 ? a.resetMs : 0
+        const bv = Number.isFinite(b.resetMs) && b.resetMs > 0 ? b.resetMs : 0
+        return av - bv
+      })
+      for (const item of rest) {
+        if (monWindows.fiveHour === undefined) monWindows.fiveHour = { percent: item.pct, resetsAt: item.resetsAt }
+        else if (monWindows.weekly === undefined) monWindows.weekly = { percent: item.pct, resetsAt: item.resetsAt }
+      }
+    }
+    if (Object.keys(monWindows).length > 0) return monWindows
+  }
+  if (Array.isArray(data.plans)) {
+    for (const plan of data.plans) {
+      if (plan === null || typeof plan !== 'object') continue
+      const total = Number(plan.total_units)
+      const used = Number(plan.used_units)
+      const pct = Number.isFinite(total) && total > 0 && Number.isFinite(used)
+        ? clampPct((used / total) * 100)
+        : normalizePercent(plan.utilization ?? plan.percent ?? plan.used_percentage)
+      if (pct === null) continue
+      const spanMs = Number(plan.period_end) * 1000 - Date.now()
+      const key = Number.isFinite(spanMs) && spanMs > 24 * 3600_000 ? 'weekly' : 'fiveHour'
+      windows[key] = { percent: pct, resetsAt: normalizeResetAt(plan.period_end) }
+    }
+  }
+  for (const [name, raw] of Object.entries(data)) {
+    if (name === 'plans' || raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const win = windowOf(raw.utilization ?? raw.percent ?? raw.used_percentage, raw.resets_at ?? raw.reset_at ?? raw.resetsAt)
+    if (win !== null) windows[name] = win
+  }
+  return Object.keys(windows).length > 0 ? windows : null
+}
+
+/** MiniMax 单条记录的剩余百分比（优先 *_remaining_percent，total 常为 0）。 */
+function remainingPercentOf(row, remainPctKey, totalKey, usedKey, remainKey) {
+  if (row === null || typeof row !== 'object') return null
+  const numeric = (key) => (row[key] == null || row[key] === '' ? NaN : Number(row[key]))
+  const rp = numeric(remainPctKey)
+  if (Number.isFinite(rp)) return Math.min(100, Math.max(0, rp <= 1 ? rp * 100 : rp))
+  const total = numeric(totalKey)
+  const used = numeric(usedKey)
+  const remain = numeric(remainKey)
+  if (Number.isFinite(total) && total > 0) {
+    if (Number.isFinite(remain)) return (remain / total) * 100
+    if (Number.isFinite(used)) return ((total - used) / total) * 100
+  }
+  return null
+}
+
+/** MiniMax 单条记录 → 5h/7d 窗口；status=3 为不限量，保留显式 ∞。 */
+function windowsFromMiniMaxRecord(row) {
+  if (row === null || typeof row !== 'object') return {}
+  const windows = {}
+  if (Number(row.current_interval_status) === 3) {
+    windows['5h'] = { unlimited: true, text: '∞', resetsAt: '' }
+  } else {
+    const remain = remainingPercentOf(row, 'current_interval_remaining_percent', 'current_interval_total_count', 'current_interval_usage_count', 'current_interval_remain_count')
+    if (remain !== null) {
+      windows['5h'] = { percent: clampPct(100 - remain), resetsAt: normalizeResetAt(row.end_time ?? row.reset_time ?? row.next_reset_time) }
+    }
+  }
+  if (Number(row.current_weekly_status) === 3) {
+    windows['7d'] = { unlimited: true, text: '∞', resetsAt: '' }
+  } else {
+    const remain = remainingPercentOf(row, 'current_weekly_remaining_percent', 'current_weekly_total_count', 'current_weekly_usage_count', 'current_weekly_remain_count')
+    if (remain !== null) {
+      windows['7d'] = { percent: clampPct(100 - remain), resetsAt: normalizeResetAt(row.weekly_end_time) }
+    }
+  }
+  return windows
+}
+
+/** 选 MiniMax 通用额度行：general → MiniMax-M* → 第一条可解析行。 */
+function pickMiniMaxModelRow(rows) {
+  const list = rows.filter((row) => row !== null && typeof row === 'object' && !/^(video|speech|audio|image)(?:$|[-_])/i.test(String(row.model_name ?? '')))
+  const byName = (name) => list.find((row) => String(row.model_name ?? '').toLowerCase() === name)
+  return byName('general')
+    ?? list.find((row) => /^minimax-m/i.test(String(row.model_name ?? '')))
+    ?? list.find((row) => Object.keys(windowsFromMiniMaxRecord(row)).length > 0)
+    ?? list[0]
+    ?? null
+}
+
+/** MiniMax：token_plan/remains（现行 model_remains）→ 平铺 → 旧数组形态。 */
+function parseMiniMaxRemains(data) {
+  if (data === null || typeof data !== 'object') return null
+  const payload = data.data !== null && typeof data.data === 'object' && !Array.isArray(data.data) ? data.data : data
+  const pickArray = (...keys) => {
+    for (const key of keys) {
+      if (Array.isArray(data?.[key])) return data[key]
+      if (Array.isArray(data?.data?.[key])) return data.data[key]
+    }
+    return null
+  }
+  const modelRows = pickArray('model_remains')
+  if (modelRows !== null) {
+    const fromRow = windowsFromMiniMaxRecord(pickMiniMaxModelRow(modelRows))
+    if (Object.keys(fromRow).length > 0) return fromRow
+    // 旧计数制：无 remaining_percent、靠 total>0 汇总。
+    let total = 0
+    let used = 0
+    let found = false
+    for (const item of modelRows) {
+      if (item === null || typeof item !== 'object') continue
+      const t = Number(item.current_interval_total_count ?? item.total)
+      const u = Number(item.current_interval_usage_count ?? item.used)
+      if (!Number.isFinite(t) || t <= 0) continue
+      found = true
+      total += t
+      used += Number.isFinite(u) ? u : 0
+    }
+    if (found && total > 0) return { current: { percent: clampPct((used / total) * 100), resetsAt: '' } }
+  }
+  const flat = windowsFromMiniMaxRecord(payload)
+  if (Object.keys(flat).length > 0) return flat
+  const windows = {}
+  const planRows = pickArray('token_plan_remains', 'plan_remains', 'remains', 'windows')
+  if (planRows !== null) {
+    planRows.forEach((row, index) => {
+      if (row === null || typeof row !== 'object') return
+      const total = Number(row.current_interval_total_count ?? row.total_count ?? row.total ?? row.limit)
+      const used = Number(row.current_interval_usage_count ?? row.used_count ?? row.usage_count ?? row.used)
+      const remain = Number(row.current_interval_remain_count ?? row.remain_count ?? row.remain ?? row.remaining)
+      let pct = null
+      if (Number.isFinite(total) && total > 0 && Number.isFinite(used)) pct = (used / total) * 100
+      else if (Number.isFinite(total) && total > 0 && Number.isFinite(remain)) pct = ((total - remain) / total) * 100
+      else pct = normalizePercent(row.utilization ?? row.percent ?? row.used_percentage)
+      if (pct === null) return
+      const labelRaw = row.interval ?? row.interval_type ?? row.window_type ?? row.type ?? row.name
+      const label = typeof labelRaw === 'string' && labelRaw.length > 0 ? labelRaw : `window${index + 1}`
+      windows[label] = { percent: clampPct(pct), resetsAt: normalizeResetAt(row.reset_time ?? row.resets_at ?? row.next_reset_time ?? row.reset_at) }
+    })
+  }
+  return Object.keys(windows).length > 0 ? windows : null
+}
+
+/** Kimi Code 订阅配额（api.kimi.com/coding/v1/usages，Kimi CLI 同款接口）。 */
+function parseKimiCodingUsage(data) {
+  if (data === null || typeof data !== 'object') return null
+  const payload = data.data && typeof data.data === 'object' ? data.data : data
+  const quota = payload.quota && typeof payload.quota === 'object' ? payload.quota : payload
+  const windows = {}
+  const numeric = (value) => (value == null || typeof value === 'boolean' || String(value).trim() === '' ? NaN : Number(value))
+  const counter = (row) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return null
+    const total = numeric(row.limit)
+    const used = numeric(row.used)
+    const remaining = numeric(row.remaining)
+    const pct = total > 0 && Number.isFinite(total)
+      ? Number.isFinite(used) && used >= 0 ? (used / total) * 100
+        : Number.isFinite(remaining) && remaining >= 0 ? ((total - remaining) / total) * 100 : NaN
+      : NaN
+    return Number.isFinite(pct) ? { percent: clampPct(pct), resetsAt: normalizeResetAt(row.resetTime ?? row.reset_time ?? row.resetAt ?? row.resetsAt) } : null
+  }
+  const usages = quota.usages ?? {}
+  const shapes = [['5h', ['limit_5h', 'limit5h']], ['weekly', ['limit_7d', 'limit7d']], ['monthly', ['limit_month_total', 'limitMonthTotal']]]
+  for (const [name, aliases] of shapes) {
+    const raw = aliases.map((key) => usages[key]).find((row) => row && typeof row === 'object' && !Array.isArray(row))
+    if (!raw) continue
+    const counted = counter(raw)
+    const ratio = numeric(raw.usedRatio ?? raw.used_ratio)
+    if (counted) windows[name] = counted
+    else if (Number.isFinite(ratio) && ratio >= 0 && ratio <= 1) {
+      windows[name] = { percent: clampPct(ratio * 100), resetsAt: normalizeResetAt(raw.resetTime ?? raw.reset_time ?? raw.resetAt) }
+    }
+  }
+  const usage = counter(quota.usage)
+  if (usage && (!Object.keys(usages).length || usages.limit_7d || usages.limit7d)) windows.weekly = usage
+  const limits = Array.isArray(quota.limits) ? quota.limits : []
+  limits.forEach((row, index) => {
+    const parsed = counter(row?.detail)
+    if (!parsed) return
+    const duration = numeric(row.window?.duration)
+    const unitRaw = String(row.window?.timeUnit ?? '').toLowerCase().replace(/^time_unit_/, '')
+    const unit = unitRaw.startsWith('hour') ? 'h' : unitRaw.startsWith('day') ? 'd'
+      : unitRaw.startsWith('week') ? 'w' : unitRaw.startsWith('minute') ? 'm'
+        : unitRaw.startsWith('month') ? 'mo' : unitRaw.slice(0, 4)
+    const name = unit === 'm' && duration === 300 ? '5h'
+      : Number.isFinite(duration) && duration > 0 && unit.length > 0 ? `${duration}${unit}` : `window${index + 1}`
+    windows[name] = parsed
+  })
+  return Object.keys(windows).length > 0 ? windows : null
+}
+
+/** Kimi / Moonshot PAYG 余额（人民币分；<100 视为已是元）。 */
+function parseKimiBalance(data) {
+  if (data === null || typeof data !== 'object') return null
+  const raw = data.available_balance ?? data.balance ?? data.cash_balance ?? data.data?.available_balance
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) return null
+  const cny = n >= 100 ? n / 100 : n
+  const win = textWindowOf(`¥${(Math.round(cny * 100) / 100).toFixed(2)}`)
+  return win === null ? null : { balance: win }
+}
+
+/** OpenRouter：{ data: { total_credits, total_usage } }（美元）→ 已用%。 */
+function parseOpenRouterCredits(data) {
+  if (data === null || typeof data !== 'object') return null
+  const d = data.data !== null && typeof data.data === 'object' ? data.data : data
+  const total = Number(d.total_credits ?? d.credits)
+  const used = Number(d.total_usage ?? d.usage)
+  if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(used)) return null
+  return { credits: { percent: clampPct((used / total) * 100), resetsAt: normalizeResetAt(d.resets_at ?? d.next_reset_time) } }
+}
+
+/** SiliconFlow：balance/amount/remain（人民币）→ 文本窗口。 */
+function parseSiliconFlowInfo(data) {
+  if (data === null || typeof data !== 'object') return null
+  const d = data.data !== null && typeof data.data === 'object' ? data.data : data
+  const n = Number(d.balance ?? d.amount ?? d.remain ?? d.remaining)
+  if (!Number.isFinite(n) || n < 0) return null
+  const win = textWindowOf(`¥${(Math.round(n * 100) / 100).toFixed(2)}`)
+  return win === null ? null : { balance: win }
+}
+
+/** CommandCode：windowLimits（used/cap）+ 月度 Credits 余额文本。 */
+function parseCommandCodeCredits(data) {
+  if (data === null || typeof data !== 'object') return null
+  const windows = {}
+  const limits = data.windowLimits
+  if (limits !== null && typeof limits === 'object' && !Array.isArray(limits)) {
+    for (const [name, raw] of Object.entries(limits)) {
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue
+      const used = Number(raw.used)
+      const cap = Number(raw.cap)
+      if (!Number.isFinite(used) || !Number.isFinite(cap) || cap <= 0 || used < 0) continue
+      windows[name] = { percent: clampPct((used / cap) * 100), resetsAt: normalizeResetAt(raw.resetAt) }
+    }
+  }
+  const monthly = Number(data.credits !== null && typeof data.credits === 'object' ? data.credits.monthlyCredits : undefined)
+  if (Number.isFinite(monthly) && monthly >= 0) {
+    const win = textWindowOf(`$${(Math.round(monthly * 100) / 100).toFixed(2)}`)
+    if (win !== null) windows.monthly = win
+  }
+  return Object.keys(windows).length > 0 ? windows : null
+}
+
+/** Cline Pass：limits[].percentUsed 已是 0-100 已用百分比，不走 0-1 猜测。 */
+function parseClinePassUsage(data) {
+  if (data === null || typeof data !== 'object') return null
+  const limits = data.data !== null && typeof data.data === 'object' ? data.data.limits : undefined
+  if (!Array.isArray(limits)) return null
+  const names = new Map([['five_hour', 'fiveHour'], ['weekly', 'weekly'], ['monthly', 'monthly']])
+  const windows = {}
+  for (const entry of limits) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+    const name = names.get(entry.type)
+    const raw = entry.percentUsed
+    const percent = typeof raw === 'number'
+      ? raw
+      : typeof raw === 'string' && /^[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?$/.test(raw.trim()) ? Number(raw) : Number.NaN
+    if (name === undefined || !Number.isFinite(percent) || percent < 0) continue
+    windows[name] = { percent: clampPct(percent), resetsAt: normalizeResetAt(entry.resetsAt) }
+  }
+  return Object.keys(windows).length > 0 ? windows : null
+}
+
+const CODING_PLAN_PARSERS = {
+  anthropic: parseAnthropicUsage,
+  zai: parseZaiUsage,
+  minimax: parseMiniMaxRemains,
+  openrouter: parseOpenRouterCredits,
+  siliconflow: parseSiliconFlowInfo,
+  commandcode: parseCommandCodeCredits,
+  clinepass: parseClinePassUsage,
+}
+
+/**
+ * 官方端点白名单（硬编码，配置不可改；MiniMax 是唯一例外——允许显式 HTTPS
+ * origin 覆盖，且经 normalizeMiniMaxOrigin 校验为公网域名）。顺序即降级链：
+ * 认证失败(401/403)与解析成功立即返回，其余错误换下一端点。
+ */
+const CODING_PLAN_ENDPOINTS = {
+  anthropic: ['https://api.anthropic.com/api/oauth/usage'],
+  zai: [
+    'https://open.bigmodel.cn/api/monitor/usage/quota/limit',
+    'https://api.z.ai/api/monitor/usage/quota/limit',
+    'https://api.z.ai/api/coding/paas/v3/dashboard/billing/coding_plan/usage',
+    'https://open.bigmodel.cn/api/coding/paas/v3/dashboard/billing/coding_plan/usage',
+  ],
+  minimax: [
+    'https://www.minimax.cn/v1/token_plan/remains',
+    'https://www.minimax.io/v1/token_plan/remains',
+    'https://www.minimaxi.com/v1/token_plan/remains',
+  ],
+  kimi: [
+    'https://api.kimi.com/coding/v1/usages',
+    'https://api.kimi.com/coding/v1/usage',
+    'https://api.moonshot.cn/v1/users/me/balance',
+  ],
+  openrouter: ['https://openrouter.ai/api/v1/credits'],
+  siliconflow: ['https://api.siliconflow.cn/v1/user/info'],
+  commandcode: ['https://api.commandcode.ai/alpha/billing/credits'],
+  clinepass: ['https://api.cline.bot/api/v1/users/me/plan/usage-limits'],
+}
+
+const CODING_PLAN_IDS = Object.keys(CODING_PLAN_ENDPOINTS)
+
+/**
+ * MiniMax 自定源归一化：只接受 HTTPS origin（无路径/凭据/空白），并拒绝
+ * 环回/内网/链路本地/裸 IP —— SSRF 硬化比上游更严（上游只查 HTTPS origin）。
+ */
+function normalizeMiniMaxOrigin(value) {
+  if (value === undefined || value === null || value === '') return ''
+  if (typeof value !== 'string' || value.length > 2048) return null
+  const text = value.trim()
+  if (!text) return ''
+  if (!/^https:\/\/[^/?#]+\/?$/i.test(text) || /[\s\\@?#]/.test(text)) return null
+  let url
+  try { url = new URL(text) } catch { return null }
+  const host = url.hostname.toLowerCase()
+  if (!host || url.username || url.password || url.pathname !== '/') return null
+  if (host === '::1' || host.endsWith('.local') || host.endsWith('.internal')) return null
+  if (/^(localhost|0\.|10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)) return null
+  if (/^\[?[0-9a-f:]+\]?$/i.test(host) && host.includes(':')) return null
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return null
+  return url.origin
+}
+
+/** 单端点抓取：Bearer 鉴权；Kimi 订阅端点须带官方 CLI 的 UA（上游实测约束）。 */
+async function fetchPlanJson(url, key, { kimiCoding = false, redirect } = {}) {
+  const headers = {
+    authorization: `Bearer ${key.trim()}`,
+    accept: 'application/json',
+    'user-agent': 'dsh-cost (DeepSeek Harness plugin)',
+  }
+  if (kimiCoding) headers['user-agent'] = 'KimiCLI/1.6'
+  return fetch(url, { headers, redirect, signal: AbortSignal.timeout(15_000) })
+}
+
+/** 响应体有界 JSON（256KiB 上限，防异常端点拖内存）。 */
+async function readJsonBounded(res, cap = 262_144) {
+  const text = await res.text()
+  if (text.length > cap) throw new Error('response too large')
+  return JSON.parse(text)
+}
+
+/**
+ * 查询单家 Coding Plan 额度：按白名单端点顺序尝试。401/403 与解析成功立即
+ * 定论，其余错误换下一端点；zai/minimax 双域 Key 不互通、kimi 订阅端点 401
+ * 视为「非订阅 Key」继续降级到 PAYG 余额端点（上游 issue #42/#53 同语义）。
+ * 全部错误均为 soft（未订阅/Key 无效属预期场景，面板中性提示）。
+ */
+async function queryCodingPlan(provider, key, origin) {
+  const urls = provider === 'minimax'
+    ? (() => {
+      const base = normalizeMiniMaxOrigin(origin)
+      if (base === null) throw Object.assign(new Error('minimax: invalid HTTPS origin'), { soft: true })
+      return base ? [`${base}/v1/token_plan/remains`, `${base}/v1/api/openplatform/coding_plan/remains`] : CODING_PLAN_ENDPOINTS.minimax
+    })()
+    : CODING_PLAN_ENDPOINTS[provider]
+  let lastError = 'HTTP error'
+  for (const url of urls) {
+    const kimiCoding = provider === 'kimi' && new URL(url).hostname === 'api.kimi.com'
+    let res
+    try {
+      res = await fetchPlanJson(url, key, {
+        kimiCoding,
+        redirect: provider === 'minimax' ? 'error' : provider === 'zai' ? 'manual' : undefined,
+      })
+    } catch (error) {
+      lastError = String(error?.message ?? error).slice(0, 120)
+      continue
+    }
+    if (res.status === 401 || res.status === 403) {
+      lastError = `HTTP ${res.status}`
+      if (provider === 'zai' || provider === 'minimax' || kimiCoding) continue
+      throw Object.assign(new Error(lastError), { soft: true })
+    }
+    if (!res.ok) { lastError = `HTTP ${res.status}`; continue }
+    let data = null
+    try { data = await readJsonBounded(res) } catch { lastError = 'invalid JSON response'; continue }
+    const windows = (kimiCoding ? parseKimiCodingUsage(data) : CODING_PLAN_PARSERS[provider](data))
+    if (windows) return { windows, endpoint: url }
+    lastError = 'no usage windows in response'
+  }
+  throw Object.assign(new Error(lastError), { soft: true })
+}
+
+
 export const Config = Schema.object({
   enabled: Schema.boolean().default(true).description('是否启用费用统计'),
   /** 展示汇率（USD → CNY）；金额账本恒存美元，展示时换算。 */
@@ -711,6 +1170,8 @@ export const Config = Schema.object({
   peakAlertNotify: Schema.boolean().default(false).description('同时发送系统通知'),
   /** DeepSeek 开放平台 API Key（选填）：配置后费用弹卡显示官方账户余额。 */
   apiKey: Schema.string().default('').description('DeepSeek 开放平台 API Key（查官方余额用，可选）'),
+  /** Coding Plan 订阅配额：{ 厂商: { key, origin? } }，Key 在费用设置页配置、不回显。 */
+  codingPlans: Schema.object({}).default({}).description('Coding Plan 订阅配额（在费用设置页配置）'),
 })
 
 export function apply(ctx, config) {
@@ -722,7 +1183,7 @@ export function apply(ctx, config) {
   if (!live.enabled) return
 
   // 设置持久化：只落与 config 不同的键，防抖 400ms 原子写。
-  const SETTINGS_KEYS = ['budgetEnabled', 'budgetAmount', 'budgetPeriod', 'peakAlertEnabled', 'peakAlertNotify', 'peakAlertLeadMinutes', 'exchangeRate', 'apiKey']
+  const SETTINGS_KEYS = ['budgetEnabled', 'budgetAmount', 'budgetPeriod', 'peakAlertEnabled', 'peakAlertNotify', 'peakAlertLeadMinutes', 'exchangeRate', 'apiKey', 'codingPlans']
   const SETTINGS_PATH = join(homedir(), '.dsh', 'storages', 'dsh-cost', 'settings.json')
   try {
     const saved = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8'))
@@ -744,9 +1205,38 @@ export function apply(ctx, config) {
     }, 400)
   }
 
+  /* -- Coding Plan 配额缓存与查询编排 -------------------------------- */
+
+  const PLAN_TTL_MS = 600_000
+  const planCache = new Map() // provider → { at, result }
+  const planKeyOf = (id) => {
+    const entry = live.codingPlans?.[id]
+    const key = typeof entry?.key === 'string' ? entry.key.trim() : ''
+    return key.length > 0 && key.length <= 4096 ? key : ''
+  }
+  async function refreshCodingPlan(id, force = false) {
+    const key = planKeyOf(id)
+    if (!key) return { hasKey: false }
+    const cached = planCache.get(id)
+    if (!force && cached && Date.now() - cached.at < PLAN_TTL_MS) return cached.result
+    let result
+    try {
+      const { windows } = await queryCodingPlan(id, key, live.codingPlans?.[id]?.origin)
+      result = { hasKey: true, windows, at: Date.now() }
+      void report(`coding plan ${id} refreshed: ${Object.keys(windows).join(',')}`)
+    } catch (error) {
+      result = { hasKey: true, error: String(error?.message ?? error).slice(0, 160), at: Date.now() }
+      void report(`coding plan ${id} refresh failed: ${result.error}`)
+    }
+    planCache.set(id, { at: Date.now(), result })
+    return result
+  }
+
   const lockPath = join(STORE_DIR, 'ledger.lock')
+  // 存储目录可能不存在（全新安装）：锁文件 openSync(wx) 要求父目录已建。
+  try { mkdirSync(STORE_DIR, { recursive: true }) } catch { /* ignore */ }
   const lock = acquireLedgerLock(lockPath)
-  void report(`server boot v0.8.2 pid=${process.pid} ledgerOwner=${lock.owner} retention=${live.retentionDays} rate=${live.exchangeRate} budget=${live.budgetEnabled ? `${live.budgetAmount}/${live.budgetPeriod}` : 'off'} backfill=${live.backfillEnabled && lock.owner ? 'on' : 'off'}`)
+  void report(`server boot v0.10.0 pid=${process.pid} ledgerOwner=${lock.owner} retention=${live.retentionDays} rate=${live.exchangeRate} budget=${live.budgetEnabled ? `${live.budgetAmount}/${live.budgetPeriod}` : 'off'} backfill=${live.backfillEnabled && lock.owner ? 'on' : 'off'} plans=${CODING_PLAN_IDS.filter((id) => planKeyOf(id)).length}`)
 
   const ledger = createLedger(live.retentionDays)
   if (lock.owner) ledger.load()
@@ -1129,7 +1619,7 @@ export function apply(ctx, config) {
           const daysLeft = daysInMonth - nowDate.getDate()
           const projected = monthCost + avgDaily * daysLeft
 
-          return json({
+          send(200, {
             monthCost,
             monthCalls,
             avgDaily,
@@ -1141,6 +1631,7 @@ export function apply(ctx, config) {
             basis: n >= 3 ? 'recent' : 'insufficient',
             recent,
           })
+          return
         }
 
         if (path === '/calls' && req.method === 'GET') {
@@ -1312,6 +1803,83 @@ export function apply(ctx, config) {
             void report(`exchange rate failed: ${String(error?.message ?? error).slice(0, 200)}`)
             send(502, { ok: false, error: String(error?.message ?? error).slice(0, 200) })
           }
+          return
+        }
+
+        // 热力图：近 N 天逐日 { cost, calls, tokens }（GitHub 贡献图样式）。
+        if (path === '/heatmap' && req.method === 'GET') {
+          const url = new URL(req.url ?? '/api/dsh-cost/heatmap', 'http://localhost')
+          const days = Math.min(365, Math.max(28, Number(url.searchParams.get('days') ?? 182)))
+          const snap = await ledgerSnapshotFresh()
+          const since = localDayKey(Date.now() - days * 86400000)
+          const rows = []
+          for (const key of Object.keys(snap.days).sort()) {
+            if (key < since) continue
+            const day = snap.days[key]
+            rows.push({
+              date: key,
+              cost: day.cost ?? 0,
+              calls: day.calls ?? 0,
+              tokens: (day.input ?? 0) + (day.output ?? 0) + (day.cacheRead ?? 0) + (day.cacheWrite ?? 0) + (day.reasoning ?? 0),
+            })
+          }
+          send(200, { days: rows })
+          return
+        }
+
+        // Coding Plan 配额：只下发窗口/错误/时间戳，Key 永不出服务端。
+        const planState = () => {
+          const providers = {}
+          for (const id of CODING_PLAN_IDS) providers[id] = { hasKey: planKeyOf(id).length > 0 }
+          for (const id of CODING_PLAN_IDS) {
+            if (!providers[id].hasKey) continue
+            const cached = planCache.get(id)
+            if (cached) providers[id] = { ...providers[id], ...cached.result, stale: Date.now() - cached.at >= PLAN_TTL_MS }
+          }
+          return providers
+        }
+        if (path === '/coding-plans' && req.method === 'GET') {
+          // 已配置且缓存过期的后台补刷：GET 不阻塞，下一轮轮询取到新值。
+          for (const id of CODING_PLAN_IDS) {
+            if (!planKeyOf(id)) continue
+            const cached = planCache.get(id)
+            if (!cached || Date.now() - cached.at >= PLAN_TTL_MS) void refreshCodingPlan(id)
+          }
+          send(200, { providers: planState() })
+          return
+        }
+        if (path === '/coding-plans/refresh' && req.method === 'POST') {
+          let raw = ''
+          for await (const chunk of req) raw += chunk
+          let body = {}
+          try { body = raw ? JSON.parse(raw) : {} } catch { send(400, { error: 'invalid-json' }); return }
+          const only = typeof body.provider === 'string' ? body.provider : ''
+          const ids = only ? [only] : CODING_PLAN_IDS.filter((id) => planKeyOf(id))
+          for (const id of ids) await refreshCodingPlan(id, true)
+          send(200, { ok: true, providers: planState() })
+          return
+        }
+        if (path === '/coding-plans/config' && req.method === 'POST') {
+          let raw = ''
+          for await (const chunk of req) raw += chunk
+          let body
+          try { body = JSON.parse(raw) } catch { send(400, { error: 'invalid-json' }); return }
+          const id = typeof body.provider === 'string' ? body.provider : ''
+          if (!CODING_PLAN_IDS.includes(id)) { send(400, { error: 'unknown-provider' }); return }
+          const key = typeof body.key === 'string' ? body.key.trim().slice(0, 4096) : ''
+          const merged = { ...(live.codingPlans ?? {}) }
+          if (key) {
+            const origin = normalizeMiniMaxOrigin(typeof body.origin === 'string' ? body.origin : undefined)
+            if (origin === null) { send(400, { error: 'invalid-origin' }); return }
+            merged[id] = origin ? { key, origin } : { key }
+          } else {
+            delete merged[id] // 空 key = 清除配置
+          }
+          live.codingPlans = merged
+          planCache.delete(id)
+          persistSettings()
+          void report(`coding plan config updated: ${id} ${key ? 'set' : 'cleared'}`)
+          send(200, { ok: true })
           return
         }
 

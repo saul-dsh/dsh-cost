@@ -2,6 +2,30 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.10.0] - 2026-11-07
+
+### Coding Plan 订阅配额 + 用量热力图 + 界面双语（对标 dsh-cost-meter 大盘）
+
+- **Coding Plan 配额面板**（对标上游 coding-plans.js 的 Bearer 子集，8 家）：
+  Anthropic (Claude Pro/Max)、Z.ai / 智谱 GLM、Kimi Code / Moonshot、
+  MiniMax、OpenRouter、SiliconFlow、CommandCode、Cline Pass。每家独立
+  Key（设置页密码框配置，只存本机 settings.json、永不回显），查询走硬编码
+  官方域名白名单（zai/minimax 双域不互通自动换域、kimi 订阅端点 401 降级
+  PAYG 余额，均沿用上游语义），10 分钟缓存 + 手动/全部刷新。窗口渲染为
+  进度条（≥80% 变警示色）或余额文本，带重置时刻；MiniMax 额外允许自定义
+  HTTPS origin（校验比上游更严：拒绝环回/内网/链路本地/裸 IP）。
+  未搬上游的 Volcano Ark（AK/SK HMAC）/SCNet（本地积分）/MiMo（Cookie）/
+  WorkBuddy（连接器）/qwen（CLI）——非 Bearer Key 形态，需要时再扩。
+- **用量热力图**：设置页新增 GitHub 贡献图样式卡（26 周 × 星期，182 天窗口），
+  费用 / 调用 / Token 三种度量切换（记忆选择），色阶用官方品牌色
+  color-mix 五档，单元格悬停显示日期 + 数值。数据走新端点
+  GET /heatmap?days=N（账本逐日聚合，受保留天数约束）。
+- **界面双语**：全 UI 文案收敛进 STRINGS 字典（zh/en），默认跟随系统语言，
+  设置页底部「中文 / English」徽标即时切换（localStorage 持久化；宿主注册
+  的分区标题等在刷新窗口后生效）。通知、弹卡、回合明细同步双语。
+- 修复 GET /forecast 生成以来一直存在的 ReferenceError（调用了不存在的
+  `json()` 助手 → 500，客户端静默吞掉导致「月底预计」卡从未出现过）。
+
 ## [0.9.0] - 2026-11-01
 
 ### 官方余额（费用弹卡新行）
